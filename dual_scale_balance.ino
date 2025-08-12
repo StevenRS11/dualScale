@@ -1,27 +1,23 @@
 /*
-  ESP32 Dual Scale – Board Init & Display Bring‑Up
-  Step 1 of N: Initialize ESP32 and connect to the display used in Deflection Tester.
+  ESP32 Dual Scale – Load Cell Display Test
+  Reads two HX711 load cells and displays both values every 5 seconds or on button press.
 */
 
-/************** CONFIG: Choose your display **************/
-#define DISPLAY_TYPE_TFT   0   // 1 = use TFT_eSPI color display (ST7789/ILI9341/etc)
-#define DISPLAY_TYPE_OLED  1   // 1 = use SSD1306 128x64 I2C OLED
+#define DISPLAY_TYPE_TFT   0
+#define DISPLAY_TYPE_OLED  1
 
-/************** CONFIG: Pins & options **************/
-#define PIN_TFT_MOSI  11
-#define PIN_TFT_MISO  13
-#define PIN_TFT_SCLK  12
-#define PIN_TFT_CS    10
-#define PIN_TFT_DC     9
-#define PIN_TFT_RST    14
-
-#define I2C_SDA       8    // ESP32-S3: SDA
-#define I2C_SCL       9    // ESP32-S3: SCL
+#define I2C_SDA       8
+#define I2C_SCL       9
 #define OLED_ADDR 0x3C
 
 #define PIN_BUTTON     0
+#define LOADCELL_DOUT1 4   // Adjust pins for your wiring
+#define LOADCELL_SCK1  5
+#define LOADCELL_DOUT2 6
+#define LOADCELL_SCK2  7
 
 #include <Arduino.h>
+#include <HX711.h>
 
 #if DISPLAY_TYPE_TFT
   #include <SPI.h>
@@ -31,16 +27,13 @@
   #include <Wire.h>
   #include <Adafruit_GFX.h>
   #include <Adafruit_SSD1306.h>
-  #ifndef SCREEN_WIDTH
-    #define SCREEN_WIDTH 128
-  #endif
-  #ifndef SCREEN_HEIGHT
-    #define SCREEN_HEIGHT 64
-  #endif
+  #define SCREEN_WIDTH 128
+  #define SCREEN_HEIGHT 64
   Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-#else
-  #error "Select a display type by setting DISPLAY_TYPE_TFT or DISPLAY_TYPE_OLED to 1"
 #endif
+
+HX711 scale1;
+HX711 scale2;
 
 namespace Display {
   void begin() {
@@ -50,7 +43,6 @@ namespace Display {
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextDatum(TL_DATUM);
-    tft.drawString("Display online", 4, 4, 2);
   #elif DISPLAY_TYPE_OLED
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
@@ -61,9 +53,6 @@ namespace Display {
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println(F("Display online"));
-    display.display();
   #endif
   }
 
@@ -75,11 +64,11 @@ namespace Display {
   #endif
   }
 
-  void printLine(int16_t y, const String &text, uint8_t font = 2) {
+  void printLine(int16_t y, const String &text) {
   #if DISPLAY_TYPE_TFT
     tft.setCursor(4, y);
     tft.setTextFont(1);
-    tft.setTextSize(font >= 2 ? 2 : 1);
+    tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.print(text);
   #else
@@ -94,37 +83,29 @@ namespace Display {
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
-  Serial.println();
-  Serial.println(F("ESP32 Dual Scale – Init & Display"));
-
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   Display::begin();
 
+  scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
+  scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
+
   Display::clear();
-  Display::printLine(0,  F("Dual Scale v0.1"));
-  Display::printLine(16, F("Board: ESP32‑S3"));
-  Display::printLine(32, F("Display OK"));
-  Display::printLine(48, F("Press button to test"));
+  Display::printLine(0, "Dual Scale Test");
 }
 
-uint32_t lastBlink = 0;
-bool blinkState = false;
+unsigned long lastUpdate = 0;
+const unsigned long updateInterval = 5000;
 
 void loop() {
-  if (millis() - lastBlink > 1000) {
-    lastBlink = millis();
-    blinkState = !blinkState;
-    Serial.printf("Heartbeat %s\n", blinkState ? "•" : "◦");
-  }
-
   bool pressed = (digitalRead(PIN_BUTTON) == LOW);
-  static bool wasPressed = false;
+  if (pressed || millis() - lastUpdate >= updateInterval) {
+    lastUpdate = millis();
+    long reading1 = scale1.get_units();
+    long reading2 = scale2.get_units();
 
-  if (pressed && !wasPressed) {
+    Serial.printf("Scale1: %ld\tScale2: %ld\n", reading1, reading2);
     Display::clear();
-    Display::printLine(0,  F("Button pressed"));
-    Display::printLine(16, String("millis: ") + millis());
+    Display::printLine(0, String("Scale1: ") + reading1);
+    Display::printLine(16, String("Scale2: ") + reading2);
   }
-  wasPressed = pressed;
 }
