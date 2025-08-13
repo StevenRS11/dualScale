@@ -2,6 +2,7 @@
 
 #include <MFRC522_I2C.h>
 
+
 // Avoid pulling in the SPI-based MFRC522 library from some NfcAdapter
 // implementations. We already included the I2C variant above which defines
 // the MFRC522 class and firmware reference tables, so prevent a second copy
@@ -13,6 +14,7 @@
 #ifndef MFRC522_H
 #define MFRC522_H
 #endif
+
 #include <NfcAdapter.h>
 #include <NdefMessage.h>
 #include <NdefRecord.h>
