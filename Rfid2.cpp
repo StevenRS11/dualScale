@@ -6,11 +6,13 @@
 static MFRC522_I2C rfid(0x28, 26, &Wire);
 static bool initialized = false;
 
-bool rfid2Begin() {
-  Wire.begin();
-  rfid.PCD_Init();          // Initialize MFRC522
+
+bool rfid2Begin(TwoWire &w) {
+  w.begin();
+  rfid.PCD_Init(); // Initialize MFRC522
+
   initialized = true;
-  return true;              // Library does not expose an error code
+  return true; // Library does not expose an error code
 }
 
 static bool waitForCard() {
@@ -39,28 +41,28 @@ bool rfid2WriteText(const String &text, String *errMsg) {
 
   // Build NDEF TLV for a simple text record in English.
   int textLen = text.length();
-  if (textLen > 240) {  // fits easily within Ultralight pages
+  if (textLen > 240) { // fits easily within Ultralight pages
     if (errMsg)
       *errMsg = F("too long");
     rfid.PICC_HaltA();
     return false;
   }
-  const int payloadLen = textLen + 3; // status + lang(2) + text
-  const int recordLen = payloadLen + 3; // header bytes
-  const int totalLen = recordLen + 3;  // TLV + terminator
-  byte ndef[recordLen + 3];            // will hold TLV + record
-  ndef[0] = 0x03;                      // NDEF message TLV
-  ndef[1] = recordLen;                 // length of NDEF message
-  ndef[2] = 0xD1;                      // MB/ME/SHORT/Type=0x01
-  ndef[3] = 0x01;                      // type length
-  ndef[4] = payloadLen;                // payload length
-  ndef[5] = 'T';                       // type 'T'
-  ndef[6] = 0x02;                      // UTF-8, language length=2
+  const int payloadLen = textLen + 3;   // status + lang(2) + text
+  const int recordLen = payloadLen + 4; // header bytes + type
+  const int totalLen = recordLen + 3;   // TLV + terminator
+  byte ndef[totalLen];                  // will hold TLV + record
+  ndef[0] = 0x03;                       // NDEF message TLV
+  ndef[1] = recordLen;                  // length of NDEF message
+  ndef[2] = 0xD1;                       // MB/ME/SHORT/Type=0x01
+  ndef[3] = 0x01;                       // type length
+  ndef[4] = payloadLen;                 // payload length
+  ndef[5] = 'T';                        // type 'T'
+  ndef[6] = 0x02;                       // UTF-8, language length=2
   ndef[7] = 'e';
   ndef[8] = 'n';
   for (int i = 0; i < textLen; ++i)
     ndef[9 + i] = text[i];
-  ndef[9 + textLen] = 0xFE;            // terminator TLV
+  ndef[2 + recordLen] = 0xFE; // terminator TLV
 
   byte buffer[4];
   int page = 4;
@@ -69,6 +71,7 @@ bool rfid2WriteText(const String &text, String *errMsg) {
       int idx = i + j;
       buffer[j] = (idx < totalLen) ? ndef[idx] : 0x00;
     }
+
     MFRC522_I2C::StatusCode status = rfid.MIFARE_Ultralight_Write(page++, buffer, 4);
     if (status != MFRC522_I2C::STATUS_OK) {
       if (errMsg)
@@ -110,7 +113,7 @@ bool rfid2ReadText(String *out, String *errMsg) {
   }
   byte data[64];
   memcpy(data, buffer, 16);
-  int needed = 2 + buffer[1] + 1;  // TLV + message + terminator
+  int needed = 2 + buffer[1] + 1; // TLV + message + terminator
   int readBytes = 16;
   int page = 8;
   while (readBytes < needed && readBytes < (int)sizeof(data)) {
@@ -154,4 +157,3 @@ bool rfid2ReadText(String *out, String *errMsg) {
     *out = text;
   return true;
 }
-
