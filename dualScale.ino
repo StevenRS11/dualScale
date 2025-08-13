@@ -20,6 +20,8 @@
 #include <HX711.h>
 #include <Preferences.h>
 
+#include "Rfid2.h"
+
 #if DISPLAY_TYPE_TFT
   #include <SPI.h>
   #include <TFT_eSPI.h>
@@ -41,20 +43,23 @@ float calFactor1 = 1.0f;
 float calFactor2 = 1.0f;
 
 const unsigned long debounceDelay = 25;
-const unsigned long longPressTime = 1000;
-
 bool buttonState = HIGH;
 bool lastButtonState = HIGH;
 unsigned long lastDebounceTime = 0;
-unsigned long buttonPressTime = 0;
 
 unsigned long lastUpdate = 0;
 const unsigned long updateInterval = 5000;
+
+float lastVal1 = 0.0f;
+float lastVal2 = 0.0f;
+
+bool nextActionIsWrite = true;
 
 long readStable(HX711 &scale);
 void updateReadings();
 void saveCalibration();
 void loadCalibration();
+void handleButtonPress();
 
 namespace Display {
   void begin() {
@@ -99,6 +104,14 @@ namespace Display {
     display.print(text);
     display.display();
   #endif
+}
+}
+
+void showStatus(const String &line1, const String &line2 = String()) {
+  Display::clear();
+  Display::printLine(0, line1);
+  if (line2.length()) {
+    Display::printLine(16, line2);
   }
 }
 
@@ -106,6 +119,9 @@ void setup() {
   Serial.begin(115200);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   Display::begin();
+  if (!rfid2Begin(Wire)) {
+    Serial.println("RFID2 init failed");
+  }
 
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
@@ -127,15 +143,7 @@ void loop() {
     if (reading != buttonState) {
       buttonState = reading;
       if (buttonState == LOW) {
-        buttonPressTime = millis();
-      } else {
-        unsigned long pressDuration = millis() - buttonPressTime;
-        if (pressDuration >= longPressTime) {
-          scale1.tare();
-          scale2.tare();
-          saveCalibration();
-        }
-        updateReadings();
+        handleButtonPress();
       }
     }
   }
@@ -176,7 +184,56 @@ void updateReadings() {
   Display::printLine(16, String("Scale2: ") + val2);
   Display::printLine(32, String("Diff: ") + diff);
 
+  lastVal1 = val1;
+  lastVal2 = val2;
   lastUpdate = millis();
+}
+
+void handleButtonPress() {
+  if (nextActionIsWrite) {
+    long diff = (long)(lastVal1 - lastVal2);
+    String diffStr = String(diff);
+    Serial.printf("Writing diff=%ld\n", diff);
+    showStatus("NFC: Tap tag to write...");
+    String err;
+    bool ok = rfid2WriteText(String("DS:") + diffStr, &err);
+    if (ok) {
+      showStatus(String("Write OK: diff=") + diffStr);
+      Serial.printf("Write OK: diff=%ld\n", diff);
+      nextActionIsWrite = false;
+    } else {
+      showStatus(String("Write FAIL: ") + err);
+      Serial.println("Write FAIL: " + err);
+      if (err != "timeout")
+        nextActionIsWrite = false;
+    }
+  } else {
+    showStatus("NFC: Tap tag to read...");
+    String text;
+    String err;
+    bool ok = rfid2ReadText(&text, &err);
+    if (ok && text.startsWith("DS:")) {
+      String diffStr = text.substring(3);
+      showStatus(String("Read: diff=") + diffStr);
+      Serial.println("Read: diff=" + diffStr);
+      nextActionIsWrite = true;
+    } else {
+      if (!ok) {
+        if (err == "timeout") {
+          showStatus("Read FAIL: timeout");
+          Serial.println("Read FAIL: timeout");
+        } else {
+          showStatus(String("Read FAIL: ") + err);
+          Serial.println("Read FAIL: " + err);
+          nextActionIsWrite = true;
+        }
+      } else {
+        showStatus("Read FAIL: no DS record");
+        Serial.println("Read FAIL: no DS record");
+        nextActionIsWrite = true;
+      }
+    }
+  }
 }
 
 void loadCalibration() {
