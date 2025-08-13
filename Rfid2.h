@@ -3,8 +3,15 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+// Enable verbose debug logging when RFID2_DEBUG is defined.
+#ifdef RFID2_DEBUG
+#define RFID2_DEBUG_PRINT(...) Serial.printf(__VA_ARGS__)
+#else
+#define RFID2_DEBUG_PRINT(...)
+#endif
+
 // Initialize the RFID2 unit. Returns true on success.
-bool rfid2Begin();
+bool rfid2Begin(TwoWire &w = Wire);
 
 // Write a text NDEF record to the tag. Returns true on success.
 // When false is returned, errMsg (if provided) contains a short reason
