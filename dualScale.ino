@@ -119,7 +119,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   Display::begin();
-  if (!rfid2Begin(Wire)) {
+  if (!rfid2Begin()) {
     Serial.println("RFID2 init failed");
   }
 
