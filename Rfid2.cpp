@@ -1,5 +1,6 @@
 #include "Rfid2.h"
 
+#include <MFRC522.h>     // Base MFRC522 library for StatusCode definitions
 #include <MFRC522_I2C.h>
 
 // MFRC522 over I2C at address 0x28 used in the M5Stack RFID2 unit.
@@ -72,8 +73,8 @@ bool rfid2WriteText(const String &text, String *errMsg) {
       buffer[j] = (idx < totalLen) ? ndef[idx] : 0x00;
     }
 
-    MFRC522_I2C::StatusCode status = rfid.MIFARE_Ultralight_Write(page++, buffer, 4);
-    if (status != MFRC522_I2C::STATUS_OK) {
+    MFRC522::StatusCode status = rfid.MIFARE_Ultralight_Write(page++, buffer, 4);
+    if (status != MFRC522::STATUS_OK) {
       if (errMsg)
         *errMsg = rfid.GetStatusCodeName(status);
       rfid.PICC_HaltA();
@@ -103,8 +104,8 @@ bool rfid2ReadText(String *out, String *errMsg) {
   // Read first 4 pages starting at page 4.
   byte buffer[18];
   byte size = sizeof(buffer);
-  MFRC522_I2C::StatusCode status = rfid.MIFARE_Read(4, buffer, &size);
-  if (status != MFRC522_I2C::STATUS_OK) {
+  MFRC522::StatusCode status = rfid.MIFARE_Read(4, buffer, &size);
+  if (status != MFRC522::STATUS_OK) {
     if (errMsg)
       *errMsg = rfid.GetStatusCodeName(status);
     rfid.PICC_HaltA();
@@ -119,7 +120,7 @@ bool rfid2ReadText(String *out, String *errMsg) {
   while (readBytes < needed && readBytes < (int)sizeof(data)) {
     size = sizeof(buffer);
     status = rfid.MIFARE_Read(page, buffer, &size);
-    if (status != MFRC522_I2C::STATUS_OK) {
+    if (status != MFRC522::STATUS_OK) {
       if (errMsg)
         *errMsg = rfid.GetStatusCodeName(status);
       rfid.PICC_HaltA();
