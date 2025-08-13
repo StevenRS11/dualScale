@@ -2,108 +2,153 @@
 
 #include <MFRC522_I2C.h>
 
-
-// Avoid pulling in the SPI-based MFRC522 library from some NfcAdapter
-// implementations. We already included the I2C variant above which defines
-// the MFRC522 class and firmware reference tables, so prevent a second copy
-// from being brought in that would redefine those symbols and break the
-// build (seen as "redefinition of MFRC522_firmware_referenceV0_0" errors).
-#ifndef MFRC522_h
-#define MFRC522_h
-#endif
-#ifndef MFRC522_H
-#define MFRC522_H
-#endif
-
-#include <NfcAdapter.h>
-#include <NdefMessage.h>
-#include <NdefRecord.h>
-
 // MFRC522 over I2C at address 0x28 used in the M5Stack RFID2 unit.
 static MFRC522 rfid(0x28);
-static NfcAdapter *nfc = nullptr;
+static bool initialized = false;
 
 bool rfid2Begin(TwoWire &w) {
+  w.begin();
   rfid.PCD_Init();          // Initialize MFRC522
-  nfc = new NfcAdapter(&rfid);
-  nfc->begin(false);
+  initialized = true;
   return true;              // Library does not expose an error code
 }
 
+static bool waitForCard() {
+  unsigned long start = millis();
+  while (true) {
+    if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial())
+      return true;
+    if (millis() - start > 3000)
+      return false;
+    delay(50);
+  }
+}
+
 bool rfid2WriteText(const String &text, String *errMsg) {
-  if (!nfc) {
+  if (!initialized) {
     if (errMsg)
       *errMsg = F("not init");
     return false;
   }
 
-  unsigned long start = millis();
-  while (!nfc->tagPresent()) {
-    if (millis() - start > 3000) {
-      if (errMsg)
-        *errMsg = F("timeout");
-      return false;
-    }
-    delay(50);
+  if (!waitForCard()) {
+    if (errMsg)
+      *errMsg = F("timeout");
+    return false;
   }
 
-  NdefMessage message;
-  message.addTextRecord(text.c_str());
-  bool ok = nfc->write(message);
-  nfc->haltTag();
-  if (!ok) {
+  // Build NDEF TLV for a simple text record in English.
+  int textLen = text.length();
+  if (textLen > 240) {  // fits easily within Ultralight pages
     if (errMsg)
-      *errMsg = F("write error");
+      *errMsg = F("too long");
+    rfid.PICC_HaltA();
+    return false;
   }
-  return ok;
+  const int payloadLen = textLen + 3; // status + lang(2) + text
+  const int recordLen = payloadLen + 3; // header bytes
+  const int totalLen = recordLen + 3;  // TLV + terminator
+  byte ndef[recordLen + 3];            // will hold TLV + record
+  ndef[0] = 0x03;                      // NDEF message TLV
+  ndef[1] = recordLen;                 // length of NDEF message
+  ndef[2] = 0xD1;                      // MB/ME/SHORT/Type=0x01
+  ndef[3] = 0x01;                      // type length
+  ndef[4] = payloadLen;                // payload length
+  ndef[5] = 'T';                       // type 'T'
+  ndef[6] = 0x02;                      // UTF-8, language length=2
+  ndef[7] = 'e';
+  ndef[8] = 'n';
+  for (int i = 0; i < textLen; ++i)
+    ndef[9 + i] = text[i];
+  ndef[9 + textLen] = 0xFE;            // terminator TLV
+
+  byte buffer[4];
+  int page = 4;
+  for (int i = 0; i < totalLen; i += 4) {
+    for (int j = 0; j < 4; ++j) {
+      int idx = i + j;
+      buffer[j] = (idx < totalLen) ? ndef[idx] : 0x00;
+    }
+    MFRC522::StatusCode status = rfid.MIFARE_Ultralight_Write(page++, buffer, 4);
+    if (status != MFRC522::STATUS_OK) {
+      if (errMsg)
+        *errMsg = rfid.GetStatusCodeName(status);
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      return false;
+    }
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+  return true;
 }
 
 bool rfid2ReadText(String *out, String *errMsg) {
-  if (!nfc) {
+  if (!initialized) {
     if (errMsg)
       *errMsg = F("not init");
     return false;
   }
 
-  unsigned long start = millis();
-  while (!nfc->tagPresent()) {
-    if (millis() - start > 3000) {
-      if (errMsg)
-        *errMsg = F("timeout");
-      return false;
-    }
-    delay(50);
+  if (!waitForCard()) {
+    if (errMsg)
+      *errMsg = F("timeout");
+    return false;
   }
 
-  NfcTag tag = nfc->read();
-  nfc->haltTag();
+  // Read first 4 pages starting at page 4.
+  byte buffer[18];
+  byte size = sizeof(buffer);
+  MFRC522::StatusCode status = rfid.MIFARE_Read(4, buffer, &size);
+  if (status != MFRC522::STATUS_OK) {
+    if (errMsg)
+      *errMsg = rfid.GetStatusCodeName(status);
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    return false;
+  }
+  byte data[64];
+  memcpy(data, buffer, 16);
+  int needed = 2 + buffer[1] + 1;  // TLV + message + terminator
+  int readBytes = 16;
+  int page = 8;
+  while (readBytes < needed && readBytes < (int)sizeof(data)) {
+    size = sizeof(buffer);
+    status = rfid.MIFARE_Read(page, buffer, &size);
+    if (status != MFRC522::STATUS_OK) {
+      if (errMsg)
+        *errMsg = rfid.GetStatusCodeName(status);
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      return false;
+    }
+    memcpy(data + readBytes, buffer, 16);
+    readBytes += 16;
+    page += 4;
+  }
 
-  if (!tag.hasNdefMessage()) {
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  if (data[0] != 0x03 || data[2] != 0xD1 || data[3] != 0x01 || data[5] != 'T') {
     if (errMsg)
       *errMsg = F("no ndef");
     return false;
   }
 
-  NdefMessage msg = tag.getNdefMessage();
-  if (msg.getRecordCount() == 0) {
-    if (errMsg)
-      *errMsg = F("no record");
-    return false;
-  }
-
-  NdefRecord rec = msg.getRecord(0);
-  const byte *payload = rec.getPayload();
-  int len = rec.getPayloadLength();
-  if (len < 3) {
+  int payloadLen = data[4];
+  int langLen = data[6] & 0x3F;
+  if (payloadLen < 1 + langLen) {
     if (errMsg)
       *errMsg = F("bad payload");
     return false;
   }
-  uint8_t langLen = payload[0] & 0x3F;
+  int textStart = 7 + langLen;
+  int textLen = payloadLen - 1 - langLen;
   String text = "";
-  for (int i = 1 + langLen; i < len; i++) {
-    text += char(payload[i]);
-  }
+  for (int i = 0; i < textLen; ++i)
+    text += char(data[textStart + i]);
 
   if (out)
     *out = text;
