@@ -85,9 +85,12 @@ bool rfid2WriteText(const String &text, String *errMsg) {
     }
 
     RFID2_DEBUG_PRINT("Writing page %d: %02X %02X %02X %02X\n", page, buffer[0], buffer[1], buffer[2], buffer[3]);
-    MFRC522_I2C::StatusCode status = rfid.MIFARE_Ultralight_Write(page, buffer, 4);
+    MFRC522_I2C::StatusCode status = static_cast<MFRC522_I2C::StatusCode>(
+        rfid.MIFARE_Ultralight_Write(page, buffer, 4));
     if (status != MFRC522_I2C::STATUS_OK) {
-      RFID2_DEBUG_PRINT("Write failed at page %d: %s\n", page, rfid.GetStatusCodeName(status));
+      RFID2_DEBUG_PRINT("Write failed at page %d: %s\n", page,
+                        rfid.GetStatusCodeName(status));
+
       if (errMsg)
         *errMsg = rfid.GetStatusCodeName(status);
       rfid.PICC_HaltA();
@@ -124,9 +127,12 @@ bool rfid2ReadText(String *out, String *errMsg) {
   byte buffer[18];
   byte size = sizeof(buffer);
   RFID2_DEBUG_PRINT("Reading page 4\n");
-  MFRC522_I2C::StatusCode status = rfid.MIFARE_Read(4, buffer, &size);
+  MFRC522_I2C::StatusCode status = static_cast<MFRC522_I2C::StatusCode>(
+      rfid.MIFARE_Read(4, buffer, &size));
   if (status != MFRC522_I2C::STATUS_OK) {
-    RFID2_DEBUG_PRINT("Read failed at page 4: %s\n", rfid.GetStatusCodeName(status));
+    RFID2_DEBUG_PRINT("Read failed at page 4: %s\n",
+                      rfid.GetStatusCodeName(status));
+
     if (errMsg)
       *errMsg = rfid.GetStatusCodeName(status);
     rfid.PICC_HaltA();
@@ -141,9 +147,12 @@ bool rfid2ReadText(String *out, String *errMsg) {
   while (readBytes < needed && readBytes < (int)sizeof(data)) {
     size = sizeof(buffer);
     RFID2_DEBUG_PRINT("Reading page %d\n", page);
-    status = rfid.MIFARE_Read(page, buffer, &size);
+    status = static_cast<MFRC522_I2C::StatusCode>(
+        rfid.MIFARE_Read(page, buffer, &size));
     if (status != MFRC522_I2C::STATUS_OK) {
-      RFID2_DEBUG_PRINT("Read failed at page %d: %s\n", page, rfid.GetStatusCodeName(status));
+      RFID2_DEBUG_PRINT("Read failed at page %d: %s\n", page,
+                        rfid.GetStatusCodeName(status));
+
       if (errMsg)
         *errMsg = rfid.GetStatusCodeName(status);
       rfid.PICC_HaltA();
