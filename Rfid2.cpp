@@ -90,6 +90,7 @@ bool rfid2WriteText(const String &text, String *errMsg) {
     if (status != MFRC522_I2C::STATUS_OK) {
       RFID2_DEBUG_PRINT("Write failed at page %d: %s\n", page,
                         rfid.GetStatusCodeName(status));
+
       if (errMsg)
         *errMsg = rfid.GetStatusCodeName(status);
       rfid.PICC_HaltA();
@@ -131,6 +132,7 @@ bool rfid2ReadText(String *out, String *errMsg) {
   if (status != MFRC522_I2C::STATUS_OK) {
     RFID2_DEBUG_PRINT("Read failed at page 4: %s\n",
                       rfid.GetStatusCodeName(status));
+
     if (errMsg)
       *errMsg = rfid.GetStatusCodeName(status);
     rfid.PICC_HaltA();
@@ -150,6 +152,7 @@ bool rfid2ReadText(String *out, String *errMsg) {
     if (status != MFRC522_I2C::STATUS_OK) {
       RFID2_DEBUG_PRINT("Read failed at page %d: %s\n", page,
                         rfid.GetStatusCodeName(status));
+
       if (errMsg)
         *errMsg = rfid.GetStatusCodeName(status);
       rfid.PICC_HaltA();
