@@ -134,7 +134,7 @@ void showStatus(const String &line1, const String &line2 = String()) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  //Serial.begin(115200);
   pinMode(PIN_TARE, INPUT_PULLUP);
   pinMode(PIN_WRITE, INPUT_PULLUP);
   pinMode(PIN_CALIBRATE, INPUT_PULLUP);
@@ -186,13 +186,13 @@ void updateReadings() {
   long raw2 = readStable(scale2);
   float val1 = (raw1 - scale1.get_offset()) / calFactor1;
   float val2 = (raw2 - scale2.get_offset()) / calFactor2;
-  float diff = val1 - val2;
 
-  Serial.printf("S1: %.2fg\tS2: %.2fg\tDiff: %.2fg\n", val1, val2, diff);
+  //Serial.printf("S1: %.2fg\tS2: %.2fg\tDiff: %.2fg\n", val1, val2, diff);
   Display::clear();
-  Display::printLine(0, String("Scale1: ") + val1 + " g");
-  Display::printLine(16, String("Scale2: ") + val2 + " g");
-  Display::printLine(32, String("Diff: ") + diff + " g");
+  Display::printLine(0, String("Static Weight: ") + (val1+val2)/28.35 + " g");
+  Display::printLine(16, String("BP: ") + calculate_BP() + " g");
+  Display::printLine(32, String("ESW: ") + estimate_MOI() + " g");
+
 
   lastVal1 = val1;
   lastVal2 = val2;
@@ -243,6 +243,16 @@ void perform_test() {
   // TODO: implement test routine
 }
 
+float calculate_BP() {
+  float oz1 = lastVal1 / 28.35;
+  float oz2 = lastVal2 / 28.35;
+
+  return (2 * oz2 + 13 * oz1) / oz1+oz2;
+}
+
+float estimate_MOI() {
+  return (calculate_BP() * 25.4)/2.08;
+}
 void waitForButton(int pin) {
   while (digitalRead(pin) == HIGH) {
     delay(10);
