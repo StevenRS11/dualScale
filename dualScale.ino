@@ -10,7 +10,9 @@
 #define I2C_SCL       9
 #define OLED_ADDR 0x3C
 
-#define PIN_BUTTON     0
+#define PIN_TARE       35
+#define PIN_WRITE      36
+#define PIN_CALIBRATE  37
 #define LOADCELL_DOUT1 4   // Adjust pins for your wiring
 #define LOADCELL_SCK1  5
 #define LOADCELL_DOUT2 6
@@ -43,9 +45,17 @@ float calFactor1 = 1.0f;
 float calFactor2 = 1.0f;
 
 const unsigned long debounceDelay = 25;
-bool buttonState = HIGH;
-bool lastButtonState = HIGH;
-unsigned long lastDebounceTime = 0;
+bool tareState = HIGH;
+bool lastTareState = HIGH;
+unsigned long lastTareDebounce = 0;
+
+bool writeState = HIGH;
+bool lastWriteState = HIGH;
+unsigned long lastWriteDebounce = 0;
+
+bool calibState = HIGH;
+bool lastCalibState = HIGH;
+unsigned long lastCalibDebounce = 0;
 
 unsigned long lastUpdate = 0;
 const unsigned long updateInterval = 5000;
@@ -53,13 +63,14 @@ const unsigned long updateInterval = 5000;
 float lastVal1 = 0.0f;
 float lastVal2 = 0.0f;
 
-bool nextActionIsWrite = true;
-
 long readStable(HX711 &scale);
 void updateReadings();
 void saveCalibration();
 void loadCalibration();
-void handleButtonPress();
+void tare();
+void writeTag();
+void calibrate();
+void handleButton(int pin, bool &state, bool &lastState, unsigned long &lastDebounce, void (*func)());
 
 namespace Display {
   void begin() {
@@ -117,7 +128,9 @@ void showStatus(const String &line1, const String &line2 = String()) {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_TARE, INPUT_PULLUP);
+  pinMode(PIN_WRITE, INPUT_PULLUP);
+  pinMode(PIN_CALIBRATE, INPUT_PULLUP);
   Display::begin();
   if (!rfid2Begin()) {
     Serial.println("RFID2 init failed");
@@ -127,27 +140,15 @@ void setup() {
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
 
   loadCalibration();
-  scale1.tare();
-  scale2.tare();
-  saveCalibration();
+  tare();
 
   updateReadings();
 }
 
 void loop() {
-  int reading = digitalRead(PIN_BUTTON);
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
-  }
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading != buttonState) {
-      buttonState = reading;
-      if (buttonState == LOW) {
-        handleButtonPress();
-      }
-    }
-  }
-  lastButtonState = reading;
+  handleButton(PIN_TARE, tareState, lastTareState, lastTareDebounce, tare);
+  handleButton(PIN_WRITE, writeState, lastWriteState, lastWriteDebounce, writeTag);
+  handleButton(PIN_CALIBRATE, calibState, lastCalibState, lastCalibDebounce, calibrate);
 
   if (millis() - lastUpdate >= updateInterval) {
     updateReadings();
@@ -189,51 +190,85 @@ void updateReadings() {
   lastUpdate = millis();
 }
 
-void handleButtonPress() {
-  if (nextActionIsWrite) {
-    long diff = (long)(lastVal1 - lastVal2);
-    String diffStr = String(diff);
-    Serial.printf("Writing diff=%ld\n", diff);
-    showStatus("NFC: Tap tag to write...");
-    String err;
-    bool ok = rfid2WriteText(String("DS:") + diffStr, &err);
-    if (ok) {
-      showStatus(String("Write OK: diff=") + diffStr);
-      Serial.printf("Write OK: diff=%ld\n", diff);
-      nextActionIsWrite = false;
-    } else {
-      showStatus(String("Write FAIL: ") + err);
-      Serial.println("Write FAIL: " + err);
-      if (err != "timeout")
-        nextActionIsWrite = false;
-    }
-  } else {
-    showStatus("NFC: Tap tag to read...");
-    String text;
-    String err;
-    bool ok = rfid2ReadText(&text, &err);
-    if (ok && text.startsWith("DS:")) {
-      String diffStr = text.substring(3);
-      showStatus(String("Read: diff=") + diffStr);
-      Serial.println("Read: diff=" + diffStr);
-      nextActionIsWrite = true;
-    } else {
-      if (!ok) {
-        if (err == "timeout") {
-          showStatus("Read FAIL: timeout");
-          Serial.println("Read FAIL: timeout");
-        } else {
-          showStatus(String("Read FAIL: ") + err);
-          Serial.println("Read FAIL: " + err);
-          nextActionIsWrite = true;
-        }
-      } else {
-        showStatus("Read FAIL: no DS record");
-        Serial.println("Read FAIL: no DS record");
-        nextActionIsWrite = true;
+void handleButton(int pin, bool &state, bool &lastState, unsigned long &lastDebounce, void (*func)()) {
+  int reading = digitalRead(pin);
+  if (reading != lastState) {
+    lastDebounce = millis();
+  }
+  if ((millis() - lastDebounce) > debounceDelay) {
+    if (reading != state) {
+      state = reading;
+      if (state == LOW) {
+        func();
       }
     }
   }
+  lastState = reading;
+}
+
+void tare() {
+  showStatus("Taring...");
+  scale1.tare();
+  scale2.tare();
+  saveCalibration();
+  showStatus("Tare done");
+}
+
+void writeTag() {
+  long diff = (long)(lastVal1 - lastVal2);
+  String diffStr = String(diff);
+  Serial.printf("Writing diff=%ld\n", diff);
+  showStatus("NFC: Tap tag to write...");
+  String err;
+  bool ok = rfid2WriteText(String("DS:") + diffStr, &err);
+  if (ok) {
+    showStatus(String("Write OK: diff=") + diffStr);
+    Serial.printf("Write OK: diff=%ld\n", diff);
+  } else {
+    showStatus(String("Write FAIL: ") + err);
+    Serial.println("Write FAIL: " + err);
+  }
+}
+
+void calibrate() {
+  showStatus("Cal: remove weight");
+  tare();
+  long offset = scale1.get_offset();
+
+  long readings[4];
+  float weights[4] = {0.0f, 100.0f, 200.0f, 300.0f};
+  readings[0] = offset;
+
+  showStatus("Cal: 100g");
+  delay(2000);
+  readings[1] = readStable(scale1);
+
+  showStatus("Cal: 200g");
+  delay(2000);
+  readings[2] = readStable(scale1);
+
+  showStatus("Cal: 300g");
+  delay(2000);
+  readings[3] = readStable(scale1);
+
+  float sumW = 0.0f, sumR = 0.0f;
+  for (int i = 0; i < 4; ++i) {
+    sumW += weights[i];
+    sumR += readings[i];
+  }
+  float meanW = sumW / 4.0f;
+  float meanR = sumR / 4.0f;
+  float num = 0.0f, den = 0.0f;
+  for (int i = 0; i < 4; ++i) {
+    num += (weights[i] - meanW) * (readings[i] - meanR);
+    den += (weights[i] - meanW) * (weights[i] - meanW);
+  }
+  calFactor1 = num / den;
+  long newOffset = (long)(meanR - calFactor1 * meanW);
+  scale1.set_scale(calFactor1);
+  scale1.set_offset(newOffset);
+  saveCalibration();
+  showStatus("Calibrate done");
 }
 
 void loadCalibration() {
