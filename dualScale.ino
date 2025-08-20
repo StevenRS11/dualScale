@@ -148,9 +148,8 @@ void setup() {
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
 
   loadCalibration();
-  tare();
-
-  updateReadings();
+  //tare();
+  //updateReadings();
 }
 
 void loop() {
@@ -194,7 +193,7 @@ void updateReadings() {
   Display::printLine(32, String("ESW: ") + estimate_MOI());
 
   Display::printLine(48, String("Handle Mass: ") + val2);
-  Display::printLine(64, String("Head Mass: ") + val1);
+  Display::printLine(56, String("Head Mass: ") + val1);
 
 
 
@@ -248,10 +247,10 @@ void perform_test() {
 }
 
 float calculate_BP() {
-  float oz1 = lastVal1 / 28.35;
-  float oz2 = lastVal2 / 28.35;
+  float head = lastVal1 / 28.35;
+  float handle = lastVal2 / 28.35;
 
-  return (2 * oz2 + 13 * oz1) / oz1+oz2;
+  return (2 * handle + 13 * head) / (head+handle);
 }
 
 float estimate_MOI() {
