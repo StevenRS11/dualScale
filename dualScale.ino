@@ -134,7 +134,7 @@ void showStatus(const String &line1, const String &line2 = String()) {
 }
 
 void setup() {
-  //Serial.begin(115200);
+  Serial.begin(115200);
   pinMode(PIN_TARE, INPUT_PULLUP);
   pinMode(PIN_WRITE, INPUT_PULLUP);
   pinMode(PIN_CALIBRATE, INPUT_PULLUP);
@@ -189,9 +189,13 @@ void updateReadings() {
 
   //Serial.printf("S1: %.2fg\tS2: %.2fg\tDiff: %.2fg\n", val1, val2, diff);
   Display::clear();
-  Display::printLine(0, String("Static Weight: ") + (val1+val2)/28.35 + " g");
-  Display::printLine(16, String("BP: ") + calculate_BP() + " g");
-  Display::printLine(32, String("ESW: ") + estimate_MOI() + " g");
+  Display::printLine(0, String("Static Weight: ") + (val1+val2)/28.35);
+  Display::printLine(16, String("BP: ") + calculate_BP());
+  Display::printLine(32, String("ESW: ") + estimate_MOI());
+
+  Display::printLine(48, String("Handle Mass: ") + val2);
+  Display::printLine(64, String("Head Mass: ") + val1);
+
 
 
   lastVal1 = val1;
