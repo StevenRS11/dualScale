@@ -13,6 +13,7 @@
 #define PIN_TARE       35
 #define PIN_WRITE      36
 #define PIN_CALIBRATE  37
+#define PIN_TEST       38
 #define LOADCELL_DOUT1 4   // Adjust pins for your wiring
 #define LOADCELL_SCK1  5
 #define LOADCELL_DOUT2 6
@@ -57,6 +58,10 @@ bool calibState = HIGH;
 bool lastCalibState = HIGH;
 unsigned long lastCalibDebounce = 0;
 
+bool testState = HIGH;
+bool lastTestState = HIGH;
+unsigned long lastTestDebounce = 0;
+
 unsigned long lastUpdate = 0;
 const unsigned long updateInterval = 5000;
 
@@ -71,6 +76,7 @@ void tare();
 void writeTag();
 void calibrate();
 void handleButton(int pin, bool &state, bool &lastState, unsigned long &lastDebounce, void (*func)());
+void perform_test();
 
 namespace Display {
   void begin() {
@@ -131,6 +137,7 @@ void setup() {
   pinMode(PIN_TARE, INPUT_PULLUP);
   pinMode(PIN_WRITE, INPUT_PULLUP);
   pinMode(PIN_CALIBRATE, INPUT_PULLUP);
+  pinMode(PIN_TEST, INPUT_PULLUP);
   Display::begin();
   if (!rfid2Begin()) {
     Serial.println("RFID2 init failed");
@@ -149,6 +156,7 @@ void loop() {
   handleButton(PIN_TARE, tareState, lastTareState, lastTareDebounce, tare);
   handleButton(PIN_WRITE, writeState, lastWriteState, lastWriteDebounce, writeTag);
   handleButton(PIN_CALIBRATE, calibState, lastCalibState, lastCalibDebounce, calibrate);
+  handleButton(PIN_TEST, testState, lastTestState, lastTestDebounce, perform_test);
 
   if (millis() - lastUpdate >= updateInterval) {
     updateReadings();
@@ -175,15 +183,15 @@ long readStable(HX711 &scale) {
 void updateReadings() {
   long raw1 = readStable(scale1);
   long raw2 = readStable(scale2);
-  float val1 = (raw1 - scale1.get_offset()) / scale1.get_scale();
-  float val2 = (raw2 - scale2.get_offset()) / scale2.get_scale();
+  float val1 = (raw1 - scale1.get_offset()) / calFactor1;
+  float val2 = (raw2 - scale2.get_offset()) / calFactor2;
   float diff = val1 - val2;
 
-  Serial.printf("S1: %.2f\tS2: %.2f\tDiff: %.2f\n", val1, val2, diff);
+  Serial.printf("S1: %.2fg\tS2: %.2fg\tDiff: %.2fg\n", val1, val2, diff);
   Display::clear();
-  Display::printLine(0, String("Scale1: ") + val1);
-  Display::printLine(16, String("Scale2: ") + val2);
-  Display::printLine(32, String("Diff: ") + diff);
+  Display::printLine(0, String("Scale1: ") + val1 + " g");
+  Display::printLine(16, String("Scale2: ") + val2 + " g");
+  Display::printLine(32, String("Diff: ") + diff + " g");
 
   lastVal1 = val1;
   lastVal2 = val2;
@@ -228,6 +236,10 @@ void writeTag() {
     showStatus(String("Write FAIL: ") + err);
     Serial.println("Write FAIL: " + err);
   }
+}
+
+void perform_test() {
+  // TODO: implement test routine
 }
 
 void calibrate() {
