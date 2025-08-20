@@ -77,6 +77,7 @@ void writeTag();
 void calibrate();
 void handleButton(int pin, bool &state, bool &lastState, unsigned long &lastDebounce, void (*func)());
 void perform_test();
+void waitForButton(int pin);
 
 namespace Display {
   void begin() {
@@ -242,45 +243,74 @@ void perform_test() {
   // TODO: implement test routine
 }
 
+void waitForButton(int pin) {
+  while (digitalRead(pin) == HIGH) {
+    delay(10);
+  }
+  while (digitalRead(pin) == LOW) {
+    delay(10);
+  }
+}
+
 void calibrate() {
-  showStatus("Cal: remove weight");
   tare();
-  long offset = scale1.get_offset();
 
-  long readings[4];
   float weights[4] = {0.0f, 100.0f, 200.0f, 300.0f};
-  readings[0] = offset;
+  long readings1[4];
+  long readings2[4];
+  readings1[0] = scale1.get_offset();
+  readings2[0] = scale2.get_offset();
 
-  showStatus("Cal: 100g");
-  delay(2000);
-  readings[1] = readStable(scale1);
+  for (int i = 1; i < 4; ++i) {
+    showStatus(String("Place ") + (int)weights[i] + "g on scale 1", "then press button");
+    waitForButton(PIN_CALIBRATE);
+    readings1[i] = readStable(scale1);
+  }
 
-  showStatus("Cal: 200g");
-  delay(2000);
-  readings[2] = readStable(scale1);
-
-  showStatus("Cal: 300g");
-  delay(2000);
-  readings[3] = readStable(scale1);
+  for (int i = 1; i < 4; ++i) {
+    showStatus(String("Place ") + (int)weights[i] + "g on scale 2", "then press button");
+    waitForButton(PIN_CALIBRATE);
+    readings2[i] = readStable(scale2);
+  }
 
   float sumW = 0.0f, sumR = 0.0f;
   for (int i = 0; i < 4; ++i) {
     sumW += weights[i];
-    sumR += readings[i];
+    sumR += readings1[i];
   }
   float meanW = sumW / 4.0f;
   float meanR = sumR / 4.0f;
   float num = 0.0f, den = 0.0f;
   for (int i = 0; i < 4; ++i) {
-    num += (weights[i] - meanW) * (readings[i] - meanR);
+    num += (weights[i] - meanW) * (readings1[i] - meanR);
     den += (weights[i] - meanW) * (weights[i] - meanW);
   }
   calFactor1 = num / den;
-  long newOffset = (long)(meanR - calFactor1 * meanW);
+  long offset1 = (long)(meanR - calFactor1 * meanW);
   scale1.set_scale(calFactor1);
-  scale1.set_offset(newOffset);
+  scale1.set_offset(offset1);
+
+  sumW = 0.0f;
+  sumR = 0.0f;
+  num = 0.0f;
+  den = 0.0f;
+  for (int i = 0; i < 4; ++i) {
+    sumW += weights[i];
+    sumR += readings2[i];
+  }
+  meanW = sumW / 4.0f;
+  meanR = sumR / 4.0f;
+  for (int i = 0; i < 4; ++i) {
+    num += (weights[i] - meanW) * (readings2[i] - meanR);
+    den += (weights[i] - meanW) * (weights[i] - meanW);
+  }
+  calFactor2 = num / den;
+  long offset2 = (long)(meanR - calFactor2 * meanW);
+  scale2.set_scale(calFactor2);
+  scale2.set_offset(offset2);
+
   saveCalibration();
-  showStatus("Calibrate done");
+  showStatus("Calibration", "complete");
 }
 
 void loadCalibration() {
