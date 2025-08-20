@@ -58,12 +58,13 @@ bool calibState = HIGH;
 bool lastCalibState = HIGH;
 unsigned long lastCalibDebounce = 0;
 
+bool firstLoop = true;
 bool testState = HIGH;
 bool lastTestState = HIGH;
 unsigned long lastTestDebounce = 0;
 
 unsigned long lastUpdate = 0;
-const unsigned long updateInterval = 5000;
+const unsigned long updateInterval = 2000;
 
 float lastVal1 = 0.0f;
 float lastVal2 = 0.0f;
@@ -148,11 +149,17 @@ void setup() {
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
 
   loadCalibration();
-  //tare();
-  //updateReadings();
 }
 
 void loop() {
+
+  if(firstLoop){
+    firstLoop = false;
+    loadCalibration();
+    tare();
+    updateReadings();
+    
+  }
   handleButton(PIN_TARE, tareState, lastTareState, lastTareDebounce, tare);
   handleButton(PIN_WRITE, writeState, lastWriteState, lastWriteDebounce, writeTag);
   handleButton(PIN_CALIBRATE, calibState, lastCalibState, lastCalibDebounce, calibrate);
