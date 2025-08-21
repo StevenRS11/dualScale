@@ -163,13 +163,19 @@ void loop() {
   if (millis() - lastUpdate >= updateInterval) {
     updateReadings();
   }
-  delay(1);
 }
 
 long readStable(HX711 &scale) {
+  // Wait for the HX711 to become ready; bail out if it never does
+  if (!scale.wait_ready_timeout(1000)) {
+    Serial.println("HX711 not ready");
+    return 0;
+  }
+
   long samples[10];
   for (int i = 0; i < 10; ++i) {
     samples[i] = scale.read();
+    delay(1);  // yield to avoid watchdog reset
   }
   long minVal = samples[0];
   long maxVal = samples[0];
@@ -186,6 +192,10 @@ long readStable(HX711 &scale) {
 void updateReadings() {
   long raw1 = readStable(scale1);
   long raw2 = readStable(scale2);
+  if (raw1 == 0 || raw2 == 0) {
+    showStatus("Load cells", "not ready");
+    return;
+  }
   float val1 = (raw1 - scale1.get_offset()) / calFactor1;
   float val2 = (raw2 - scale2.get_offset()) / calFactor2;
 
@@ -244,8 +254,18 @@ void handleButton(int pin, bool &state, bool &lastState, unsigned long &lastDebo
 
 void tare() {
   showStatus("Taring...");
-  scale1.tare();
-  scale2.tare();
+  if (scale1.wait_ready_timeout(1000)) {
+    scale1.tare();
+  } else {
+    Serial.println("scale1 tare timeout");
+  }
+  if (scale2.wait_ready_timeout(1000)) {
+    scale2.tare();
+  } else {
+    Serial.println("scale2 tare timeout");
+  }
+  saveCalibration();
+
   showStatus("Tare done");
 }
 
