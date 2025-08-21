@@ -141,25 +141,19 @@ void setup() {
   pinMode(PIN_CALIBRATE, INPUT_PULLUP);
   pinMode(PIN_TEST, INPUT_PULLUP);
   Display::begin();
+  Wire.setClock(400000);
   if (!rfid2Begin()) {
     Serial.println("RFID2 init failed");
   }
 
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
-
+  tare();
   loadCalibration();
 }
 
 void loop() {
 
-  if(firstLoop){
-    firstLoop = false;
-    loadCalibration();
-    tare();
-    updateReadings();
-    
-  }
   handleButton(PIN_TARE, tareState, lastTareState, lastTareDebounce, tare);
   handleButton(PIN_WRITE, writeState, lastWriteState, lastWriteDebounce, writeTag);
   handleButton(PIN_CALIBRATE, calibState, lastCalibState, lastCalibDebounce, calibrate);
@@ -168,6 +162,7 @@ void loop() {
   if (millis() - lastUpdate >= updateInterval) {
     updateReadings();
   }
+  delay(1);
 }
 
 long readStable(HX711 &scale) {
@@ -193,22 +188,43 @@ void updateReadings() {
   float val1 = (raw1 - scale1.get_offset()) / calFactor1;
   float val2 = (raw2 - scale2.get_offset()) / calFactor2;
 
-  //Serial.printf("S1: %.2fg\tS2: %.2fg\tDiff: %.2fg\n", val1, val2, diff);
-  Display::clear();
-  Display::printLine(0, String("Static Weight: ") + (val1+val2)/28.35);
-  Display::printLine(16, String("BP: ") + calculate_BP());
-  Display::printLine(32, String("ESW: ") + estimate_MOI());
+  // Precompute strings (fixed positions, 8px line height on 128x64):
+  String l0 = String("Static Weight: ") + String((val1 + val2) / 28.35, 2);
+  String l1 = String("BP: ") + String(calculate_BP());
+  String l2 = String("ESW: ") + String(estimate_MOI());
+  String l3 = String("Handle Mass: ") + String(val2, 2);
+  String l4 = String("Head Mass: ") + String(val1, 2);
 
-  Display::printLine(48, String("Handle Mass: ") + val2);
-  Display::printLine(56, String("Head Mass: ") + val1);
+  // Static cache of last-drawn text to decide what to repaint
+  static String p0, p1, p2, p3, p4;
 
+  auto drawLineIfChanged = [&](int y, const String& now, String& prev) {
+    if (now == prev) return;            // no repaint needed
 
+    // Erase only this row area (full width, 8px height for default font)
+    display.fillRect(0, y, 128, 8, BLACK);
+    display.setCursor(0, y);
+    display.setTextColor(WHITE);
+    display.print(now);
+
+    prev = now;
+  };
+
+  // Begin a frame: DO NOT push yet
+  // (No display.clearDisplay() here; we only clear changed rows.)
+  drawLineIfChanged(0,  l0, p0);
+  drawLineIfChanged(16, l1, p1);
+  drawLineIfChanged(32, l2, p2);
+  drawLineIfChanged(48, l3, p3);
+  drawLineIfChanged(56, l4, p4);
+
+  // Push the buffer ONCE
+  display.display();
 
   lastVal1 = val1;
   lastVal2 = val2;
   lastUpdate = millis();
 }
-
 void handleButton(int pin, bool &state, bool &lastState, unsigned long &lastDebounce, void (*func)()) {
   int reading = digitalRead(pin);
   if (reading != lastState) {
@@ -229,7 +245,6 @@ void tare() {
   showStatus("Taring...");
   scale1.tare();
   scale2.tare();
-  saveCalibration();
   showStatus("Tare done");
 }
 
@@ -261,7 +276,8 @@ float calculate_BP() {
 }
 
 float estimate_MOI() {
-  return (calculate_BP() * 25.4)/2.08;
+  
+  return (calculate_BP() * 25.4)/(2.08);
 }
 void waitForButton(int pin) {
   while (digitalRead(pin) == HIGH) {
