@@ -148,6 +148,7 @@ void setup() {
 
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
+  
   tare();
   loadCalibration();
 }
