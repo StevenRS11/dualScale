@@ -58,12 +58,13 @@ bool calibState = HIGH;
 bool lastCalibState = HIGH;
 unsigned long lastCalibDebounce = 0;
 
+bool firstLoop = true;
 bool testState = HIGH;
 bool lastTestState = HIGH;
 unsigned long lastTestDebounce = 0;
 
 unsigned long lastUpdate = 0;
-const unsigned long updateInterval = 5000;
+const unsigned long updateInterval = 2000;
 
 float lastVal1 = 0.0f;
 float lastVal2 = 0.0f;
@@ -140,20 +141,20 @@ void setup() {
   pinMode(PIN_CALIBRATE, INPUT_PULLUP);
   pinMode(PIN_TEST, INPUT_PULLUP);
   Display::begin();
+  Wire.setClock(400000);
   if (!rfid2Begin()) {
     Serial.println("RFID2 init failed");
   }
 
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
-
-  loadCalibration();
+  
   tare();
-
-  updateReadings();
+  loadCalibration();
 }
 
 void loop() {
+
   handleButton(PIN_TARE, tareState, lastTareState, lastTareDebounce, tare);
   handleButton(PIN_WRITE, writeState, lastWriteState, lastWriteDebounce, writeTag);
   handleButton(PIN_CALIBRATE, calibState, lastCalibState, lastCalibDebounce, calibrate);
@@ -162,9 +163,6 @@ void loop() {
   if (millis() - lastUpdate >= updateInterval) {
     updateReadings();
   }
-
-  // Allow background tasks to run and feed the watchdog
-  delay(1);
 }
 
 long readStable(HX711 &scale) {
@@ -200,19 +198,44 @@ void updateReadings() {
   }
   float val1 = (raw1 - scale1.get_offset()) / calFactor1;
   float val2 = (raw2 - scale2.get_offset()) / calFactor2;
-  float diff = val1 - val2;
 
-  Serial.printf("S1: %.2fg\tS2: %.2fg\tDiff: %.2fg\n", val1, val2, diff);
-  Display::clear();
-  Display::printLine(0, String("Scale1: ") + val1 + " g");
-  Display::printLine(16, String("Scale2: ") + val2 + " g");
-  Display::printLine(32, String("Diff: ") + diff + " g");
+  // Precompute strings (fixed positions, 8px line height on 128x64):
+  String l0 = String("Static Weight: ") + String((val1 + val2) / 28.35, 2);
+  String l1 = String("BP: ") + String(calculate_BP());
+  String l2 = String("ESW: ") + String(estimate_MOI());
+  String l3 = String("Handle Mass: ") + String(val2, 2);
+  String l4 = String("Head Mass: ") + String(val1, 2);
+
+  // Static cache of last-drawn text to decide what to repaint
+  static String p0, p1, p2, p3, p4;
+
+  auto drawLineIfChanged = [&](int y, const String& now, String& prev) {
+    if (now == prev) return;            // no repaint needed
+
+    // Erase only this row area (full width, 8px height for default font)
+    display.fillRect(0, y, 128, 8, BLACK);
+    display.setCursor(0, y);
+    display.setTextColor(WHITE);
+    display.print(now);
+
+    prev = now;
+  };
+
+  // Begin a frame: DO NOT push yet
+  // (No display.clearDisplay() here; we only clear changed rows.)
+  drawLineIfChanged(0,  l0, p0);
+  drawLineIfChanged(16, l1, p1);
+  drawLineIfChanged(32, l2, p2);
+  drawLineIfChanged(48, l3, p3);
+  drawLineIfChanged(56, l4, p4);
+
+  // Push the buffer ONCE
+  display.display();
 
   lastVal1 = val1;
   lastVal2 = val2;
   lastUpdate = millis();
 }
-
 void handleButton(int pin, bool &state, bool &lastState, unsigned long &lastDebounce, void (*func)()) {
   int reading = digitalRead(pin);
   if (reading != lastState) {
@@ -242,6 +265,7 @@ void tare() {
     Serial.println("scale2 tare timeout");
   }
   saveCalibration();
+
   showStatus("Tare done");
 }
 
@@ -265,6 +289,17 @@ void perform_test() {
   // TODO: implement test routine
 }
 
+float calculate_BP() {
+  float head = lastVal1 / 28.35;
+  float handle = lastVal2 / 28.35;
+
+  return (2 * handle + 13 * head) / (head+handle);
+}
+
+float estimate_MOI() {
+  
+  return (calculate_BP() * 25.4)/(2.08);
+}
 void waitForButton(int pin) {
   while (digitalRead(pin) == HIGH) {
     delay(10);
