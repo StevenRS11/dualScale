@@ -142,20 +142,20 @@ void setup() {
   pinMode(PIN_WRITE, INPUT_PULLUP);
   pinMode(PIN_CALIBRATE, INPUT_PULLUP);
   pinMode(PIN_TEST, INPUT_PULLUP);
-  //Display::begin();
-  //Wire.setClock(400000);
+  Display::begin();
+  Wire.setClock(400000);
   
-  /**
+  
   if (!rfid2Begin()) {
-    Serial.println("RFID2 init failed");
+    //Serial.println("RFID2 init failed");
   }
-  **/
+  
 
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
   
-  //tare();
-  //loadCalibration();
+  tare();
+  loadCalibration();
 }
 
 void loop() {
@@ -166,7 +166,7 @@ void loop() {
   handleButton(PIN_TEST, testState, lastTestState, lastTestDebounce, perform_test);
 
   if (millis() - lastUpdate >= updateInterval) {
-   // updateReadings();
+     updateReadings();
   }
 }
 
