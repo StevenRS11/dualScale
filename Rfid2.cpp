@@ -17,7 +17,7 @@ bool rfid2Begin(TwoWire &w) {
   return true; // Library does not expose an error code
 }
 
-static bool waitForCard() {
+static bool waitForCard(int wait) {
   RFID2_DEBUG_PRINT("waitForCard: waiting for tag\n");
   unsigned long start = millis();
   while (true) {
@@ -25,13 +25,18 @@ static bool waitForCard() {
       RFID2_DEBUG_PRINT("waitForCard: tag detected\n");
       return true;
     }
-    if (millis() - start > 3000) {
+    if (millis() - start > wait) {
       RFID2_DEBUG_PRINT("waitForCard: timeout\n");
       return false;
     }
     delay(50);
   }
 }
+
+static bool waitForCard() {
+  return waitForCard(3000);
+}
+
 
 bool rfid2WriteText(const String &text, String *errMsg) {
   RFID2_DEBUG_PRINT("rfid2WriteText: '%s'\n", text.c_str());
