@@ -305,8 +305,9 @@ void pollNfcAndWrite() {
     String text;
     String err;
     bool handled = false;
-    
-    if (rfid2ReadText(&text, &err)) {
+    if (rfid2ReadText(&text, &err, false)) {
+
+
       text.trim();
       text.toUpperCase();
       if (text == "CAL") {
@@ -331,6 +332,9 @@ void pollNfcAndWrite() {
         showStatus("NFC write FAIL", err);
         Serial.println("NFC write FAIL: " + err);
       }
+    } else {
+      rfid2Halt();
+
     }
   }
 
