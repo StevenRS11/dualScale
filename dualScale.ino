@@ -8,16 +8,19 @@
 
 #define I2C_SDA       8
 #define I2C_SCL       9
+
 #define OLED_ADDR 0x3C
 
 #define PIN_TARE       35
 #define PIN_WRITE      36
 #define PIN_CALIBRATE  37
 #define PIN_TEST       38
-#define LOADCELL_DOUT1 4   // Adjust pins for your wiring
-#define LOADCELL_SCK1  5
-#define LOADCELL_DOUT2 6
-#define LOADCELL_SCK2  7
+
+
+#define LOADCELL_DOUT1 5   // Adjust pins for your wiring
+#define LOADCELL_SCK1  4
+#define LOADCELL_DOUT2 41
+#define LOADCELL_SCK2  40
 
 #include <Arduino.h>
 #include <HX711.h>
