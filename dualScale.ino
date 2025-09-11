@@ -136,13 +136,21 @@ void setup() {
   pinMode(PIN_TARE, INPUT_PULLUP);
   pinMode(PIN_CALIBRATE, INPUT_PULLUP);
   pinMode(PIN_TEST, INPUT_PULLUP);
+  
+  Serial.println("Display Init start");
   Display::begin();
+  Serial.println("Display Init finish");
+
   Wire.setClock(400000);
 
   // NFC init
+  Serial.println("RFID Init Start");
+
   if (!rfid2Begin()) {
     Serial.println("RFID2 init failed");
   }
+  Serial.println("RFID Init Finish");
+
 
   // Load cells
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
@@ -297,6 +305,7 @@ void pollNfcAndWrite() {
     String text;
     String err;
     bool handled = false;
+    
     if (rfid2ReadText(&text, &err)) {
       text.trim();
       text.toUpperCase();
