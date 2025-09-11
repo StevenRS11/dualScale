@@ -4,6 +4,7 @@
 #include <Wire.h>
 
 // Enable verbose debug logging when RFID2_DEBUG is defined.
+#define RFID2_DEBUG 1
 #ifdef RFID2_DEBUG
 #define RFID2_DEBUG_PRINT(...) Serial.printf(__VA_ARGS__)
 #else
