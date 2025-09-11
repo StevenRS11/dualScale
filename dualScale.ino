@@ -284,26 +284,46 @@ void tare() {
   showStatus("Tare done");
 }
 
-// NOTE: write-once per presence edge; no manual write button, no read functionality
+// NOTE: write-once per presence edge
 void pollNfcAndWrite() {
   bool present = false;
-  #ifdef ARDUINO
-    // If your Rfid2.h exposes a presence checker, use it:
-    present = waitForCard(100);
-  #endif
+#ifdef ARDUINO
+  // If your Rfid2.h exposes a presence checker, use it:
+  present = waitForCard(100);
+#endif
 
-  // On rising edge of presence -> write
+  // On rising edge of presence -> read command or write diff
   if (present && !nfcWasPresent) {
-    long diff = (long)(lastVal1 - lastVal2);
-    String diffStr = String(diff);
+    String text;
     String err;
-    bool ok = rfid2WriteText(String("DS:") + diffStr, &err);
-    if (ok) {
-      showStatus("NFC write OK", String("diff=") + diffStr);
-      Serial.printf("NFC write OK: diff=%ld\n", diff);
+    bool handled = false;
+    if (rfid2ReadText(&text, &err, false)) {
+      text.trim();
+      text.toUpperCase();
+      if (text == "CAL") {
+        showStatus("NFC cmd: CAL");
+        calibrate();
+        handled = true;
+      } else if (text == "TARE") {
+        showStatus("NFC cmd: TARE");
+        tare();
+        handled = true;
+      }
+    }
+
+    if (!handled) {
+      long diff = (long)(lastVal1 - lastVal2);
+      String diffStr = String(diff);
+      bool ok = rfid2WriteText(String("DS:") + diffStr, &err);
+      if (ok) {
+        showStatus("NFC write OK", String("diff=") + diffStr);
+        Serial.printf("NFC write OK: diff=%ld\n", diff);
+      } else {
+        showStatus("NFC write FAIL", err);
+        Serial.println("NFC write FAIL: " + err);
+      }
     } else {
-      showStatus("NFC write FAIL", err);
-      Serial.println("NFC write FAIL: " + err);
+      rfid2Halt();
     }
   }
 

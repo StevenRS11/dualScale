@@ -24,6 +24,10 @@ bool waitForCard();
 bool rfid2WriteText(const String &text, String *errMsg = nullptr);
 
 // Read a text NDEF record from the tag. The retrieved text is stored in `out`.
-// Returns true on success.
-bool rfid2ReadText(String *out, String *errMsg = nullptr);
+// When `halt` is true (default), the tag is halted after reading; pass false if
+// you plan to perform additional operations, such as a subsequent write.
+bool rfid2ReadText(String *out, String *errMsg = nullptr, bool halt = true);
+
+// Halt communication with the currently selected tag.
+void rfid2Halt();
 

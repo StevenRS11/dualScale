@@ -60,7 +60,7 @@ bool rfid2WriteText(const String &text, String *errMsg) {
     RFID2_DEBUG_PRINT("rfid2WriteText: text too long (%d)\n", textLen);
     if (errMsg)
       *errMsg = F("too long");
-    rfid.PICC_HaltA();
+    rfid2Halt();
     return false;
   }
   const int payloadLen = textLen + 3;   // status + lang(2) + text
@@ -98,21 +98,27 @@ bool rfid2WriteText(const String &text, String *errMsg) {
 
       if (errMsg)
         *errMsg = rfid.GetStatusCodeName(status);
-      rfid.PICC_HaltA();
-      rfid.PCD_StopCrypto1();
+      rfid2Halt();
       return false;
     }
     RFID2_DEBUG_PRINT("Page %d written\n", page);
     page++;
   }
 
-  rfid.PICC_HaltA();
-  rfid.PCD_StopCrypto1();
+  rfid2Halt();
   RFID2_DEBUG_PRINT("rfid2WriteText: complete\n");
   return true;
 }
 
-bool rfid2ReadText(String *out, String *errMsg) {
+void rfid2Halt() {
+  if (!initialized) {
+    return;
+  }
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+bool rfid2ReadText(String *out, String *errMsg, bool halt) {
   RFID2_DEBUG_PRINT("rfid2ReadText: start\n");
   if (!initialized) {
     RFID2_DEBUG_PRINT("rfid2ReadText: not initialized\n");
@@ -140,8 +146,8 @@ bool rfid2ReadText(String *out, String *errMsg) {
 
     if (errMsg)
       *errMsg = rfid.GetStatusCodeName(status);
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
+    if (halt)
+      rfid2Halt();
     return false;
   }
   byte data[64];
@@ -160,8 +166,8 @@ bool rfid2ReadText(String *out, String *errMsg) {
 
       if (errMsg)
         *errMsg = rfid.GetStatusCodeName(status);
-      rfid.PICC_HaltA();
-      rfid.PCD_StopCrypto1();
+      if (halt)
+        rfid2Halt();
       return false;
     }
     memcpy(data + readBytes, buffer, 16);
@@ -169,8 +175,8 @@ bool rfid2ReadText(String *out, String *errMsg) {
     page += 4;
   }
 
-  rfid.PICC_HaltA();
-  rfid.PCD_StopCrypto1();
+  if (halt)
+    rfid2Halt();
 
   if (data[0] != 0x03 || data[2] != 0xD1 || data[3] != 0x01 || data[5] != 'T') {
     RFID2_DEBUG_PRINT("rfid2ReadText: no NDEF header\n");
