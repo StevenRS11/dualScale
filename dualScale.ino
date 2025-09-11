@@ -289,7 +289,7 @@ void pollNfcAndWrite() {
   bool present = false;
   #ifdef ARDUINO
     // If your Rfid2.h exposes a presence checker, use it:
-    present = waitForCard();
+    present = waitForCard(100);
   #endif
 
   // On rising edge of presence -> write

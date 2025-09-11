@@ -17,7 +17,7 @@ bool rfid2Begin(TwoWire &w) {
   return true; // Library does not expose an error code
 }
 
-static bool waitForCard(int wait) {
+ bool waitForCard(int wait) {
   RFID2_DEBUG_PRINT("waitForCard: waiting for tag\n");
   unsigned long start = millis();
   while (true) {
@@ -33,7 +33,7 @@ static bool waitForCard(int wait) {
   }
 }
 
-static bool waitForCard() {
+bool waitForCard() {
   return waitForCard(3000);
 }
 
