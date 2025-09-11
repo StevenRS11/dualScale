@@ -298,6 +298,7 @@ void pollNfcAndWrite() {
     String err;
     bool handled = false;
     if (rfid2ReadText(&text, &err, false)) {
+
       text.trim();
       text.toUpperCase();
       if (text == "CAL") {
@@ -324,6 +325,7 @@ void pollNfcAndWrite() {
       }
     } else {
       rfid2Halt();
+
     }
   }
 
