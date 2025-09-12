@@ -13,11 +13,6 @@
 
 #define OLED_ADDR 0x3C
 
-#define PIN_TARE       35
-//#define PIN_WRITE    36            // (no longer used)
-#define PIN_CALIBRATE  37
-#define PIN_TEST       38
-
 #define LOADCELL_DOUT1 5   // Adjust pins for your wiring
 #define LOADCELL_SCK1  4
 #define LOADCELL_DOUT2 41
@@ -49,11 +44,6 @@ Preferences prefs;
 float calFactor1 = 1.0f;
 float calFactor2 = 1.0f;
 
-const unsigned long debounceDelay = 25;
-bool tareState = HIGH;
-bool lastTareState = HIGH;
-unsigned long lastTareDebounce = 0;
-
 // NFC auto-polling state
 const unsigned long updateInterval = 2000;   // display + reading cadence
 const unsigned long nfcPollInterval = 2000;  // NFC presence check cadence
@@ -63,16 +53,14 @@ bool nfcWasPresent = false;                  // edge-detect so we only write onc
 
 float lastVal1 = 0.0f;
 float lastVal2 = 0.0f;
-
+ 
 long readStable(HX711 &scale);
 void updateReadings();
 void saveCalibration();
 void loadCalibration();
 void tare();
 void calibrate();
-void handleButton(int pin, bool &state, bool &lastState, unsigned long &lastDebounce, void (*func)());
 void perform_test();
-void waitForButton(int pin);
 void pollNfcAndWrite();
 
 namespace Display {
@@ -132,11 +120,6 @@ void showStatus(const String &line1, const String &line2 = String()) {
 void setup() {
   Serial.begin(115200);
   Serial.println("Init start");
-
-  pinMode(PIN_TARE, INPUT_PULLUP);
-  pinMode(PIN_CALIBRATE, INPUT_PULLUP);
-  pinMode(PIN_TEST, INPUT_PULLUP);
-  
   Serial.println("Display Init start");
   Display::begin();
   Serial.println("Display Init finish");
@@ -161,14 +144,6 @@ void setup() {
 }
 
 void loop() {
-  // Buttons (no WRITE button anymore)
-  handleButton(PIN_TARE,      tareState,  lastTareState,  lastTareDebounce,  tare);
-  // handleButton for PIN_WRITE removed
-  static bool calibState = HIGH, lastCalibState = HIGH; static unsigned long lastCalibDebounce = 0;
-  static bool testState  = HIGH, lastTestState  = HIGH; static unsigned long lastTestDebounce  = 0;
-  handleButton(PIN_CALIBRATE, calibState, lastCalibState, lastCalibDebounce, calibrate);
-  handleButton(PIN_TEST,      testState,  lastTestState,  lastTestDebounce,  perform_test);
-
   // Periodic readings + display
   if (millis() - lastUpdate >= updateInterval) {
      updateReadings();
@@ -260,22 +235,6 @@ void updateReadings() {
   lastUpdate = millis();
 }
 
-void handleButton(int pin, bool &state, bool &lastState, unsigned long &lastDebounce, void (*func)()) {
-  int reading = digitalRead(pin);
-  if (reading != lastState) {
-    lastDebounce = millis();
-  }
-  if ((millis() - lastDebounce) > debounceDelay) {
-    if (reading != state) {
-      state = reading;
-      if (state == LOW) {
-        func();
-      }
-    }
-  }
-  lastState = reading;
-}
-
 void tare() {
   showStatus("Taring...");
   if (scale1.wait_ready_timeout(1000)) {
@@ -355,15 +314,6 @@ float estimate_MOI() {
   return (calculate_BP() * 25.4) / (2.08);
 }
 
-void waitForButton(int pin) {
-  while (digitalRead(pin) == HIGH) {
-    delay(10);
-  }
-  while (digitalRead(pin) == LOW) {
-    delay(10);
-  }
-}
-
 void calibrate() {
   tare();
 
@@ -374,14 +324,20 @@ void calibrate() {
   readings2[0] = scale2.get_offset();
 
   for (int i = 1; i < 4; ++i) {
-    showStatus(String("Place ") + (int)weights[i] + "g on scale 1", "then press button");
-    waitForButton(PIN_CALIBRATE);
+    showStatus(String("Place ") + (int)weights[i] + "g on scale 1", "then present card");
+    while (!waitForCard()) {
+      // keep waiting for any card
+    }
+    rfid2Halt();
     readings1[i] = readStable(scale1);
   }
 
   for (int i = 1; i < 4; ++i) {
-    showStatus(String("Place ") + (int)weights[i] + "g on scale 2", "then press button");
-    waitForButton(PIN_CALIBRATE);
+    showStatus(String("Place ") + (int)weights[i] + "g on scale 2", "then present card");
+    while (!waitForCard()) {
+      // keep waiting for any card
+    }
+    rfid2Halt();
     readings2[i] = readStable(scale2);
   }
 
