@@ -1,6 +1,8 @@
 /*
-  ESP32 Dual Scale – Load Cell Display Test
-  Reads two HX711 load cells and displays both values every 5 seconds or on button press.
+  ESP32 Dual Scale – Load Cell Display Test (Auto NFC Write)
+  Reads two HX711 load cells and displays both values every 2 seconds.
+  NFC tags are checked automatically every 2 seconds; if a tag is PRESENT,
+  the device writes once (on presence edge) and does not read from NFC at all.
 */
 
 #define DISPLAY_TYPE_TFT   0
@@ -8,19 +10,19 @@
 
 #define I2C_SDA       8
 #define I2C_SCL       9
+
 #define OLED_ADDR 0x3C
 
-#define PIN_BUTTON     0
-#define LOADCELL_DOUT1 4   // Adjust pins for your wiring
-#define LOADCELL_SCK1  5
-#define LOADCELL_DOUT2 6
-#define LOADCELL_SCK2  7
+#define LOADCELL_DOUT1 5   // Adjust pins for your wiring
+#define LOADCELL_SCK1  4
+#define LOADCELL_DOUT2 41
+#define LOADCELL_SCK2  40
 
 #include <Arduino.h>
 #include <HX711.h>
 #include <Preferences.h>
 
-#include "Rfid2.h"
+#include "Rfid2.h"  // assumes: bool rfid2IsTagPresent(); bool rfid2WriteText(const String&, String* err);
 
 #if DISPLAY_TYPE_TFT
   #include <SPI.h>
@@ -42,24 +44,24 @@ Preferences prefs;
 float calFactor1 = 1.0f;
 float calFactor2 = 1.0f;
 
-const unsigned long debounceDelay = 25;
-bool buttonState = HIGH;
-bool lastButtonState = HIGH;
-unsigned long lastDebounceTime = 0;
-
+// NFC auto-polling state
+const unsigned long updateInterval = 2000;   // display + reading cadence
+const unsigned long nfcPollInterval = 2000;  // NFC presence check cadence
 unsigned long lastUpdate = 0;
-const unsigned long updateInterval = 5000;
+unsigned long lastNfcPoll = 0;
+bool nfcWasPresent = false;                  // edge-detect so we only write once per tap
 
 float lastVal1 = 0.0f;
 float lastVal2 = 0.0f;
-
-bool nextActionIsWrite = true;
-
+ 
 long readStable(HX711 &scale);
 void updateReadings();
 void saveCalibration();
 void loadCalibration();
-void handleButtonPress();
+void tare();
+void calibrate();
+void perform_test();
+void pollNfcAndWrite();
 
 namespace Display {
   void begin() {
@@ -104,7 +106,7 @@ namespace Display {
     display.print(text);
     display.display();
   #endif
-}
+ }
 }
 
 void showStatus(const String &line1, const String &line2 = String()) {
@@ -117,47 +119,54 @@ void showStatus(const String &line1, const String &line2 = String()) {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  Serial.println("Init start");
+  Serial.println("Display Init start");
   Display::begin();
+  Serial.println("Display Init finish");
+
+  Wire.setClock(400000);
+
+  // NFC init
+  Serial.println("RFID Init Start");
+
   if (!rfid2Begin()) {
     Serial.println("RFID2 init failed");
   }
+  Serial.println("RFID Init Finish");
 
+
+  // Load cells
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
 
+  tare();
   loadCalibration();
-  scale1.tare();
-  scale2.tare();
-  saveCalibration();
-
-  updateReadings();
 }
 
 void loop() {
-  int reading = digitalRead(PIN_BUTTON);
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
-  }
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading != buttonState) {
-      buttonState = reading;
-      if (buttonState == LOW) {
-        handleButtonPress();
-      }
-    }
-  }
-  lastButtonState = reading;
-
+  // Periodic readings + display
   if (millis() - lastUpdate >= updateInterval) {
-    updateReadings();
+     updateReadings();
+  }
+
+  // Periodic NFC polling (auto-write on presence edge)
+  if (millis() - lastNfcPoll >= nfcPollInterval) {
+     pollNfcAndWrite();
+     lastNfcPoll = millis();
   }
 }
 
 long readStable(HX711 &scale) {
+  // Wait for the HX711 to become ready; bail out if it never does
+  if (!scale.wait_ready_timeout(1000)) {
+    Serial.println("HX711 not ready");
+    return 0;
+  }
+
   long samples[10];
   for (int i = 0; i < 10; ++i) {
     samples[i] = scale.read();
+    delay(1);  // yield to avoid watchdog reset
   }
   long minVal = samples[0];
   long maxVal = samples[0];
@@ -174,66 +183,181 @@ long readStable(HX711 &scale) {
 void updateReadings() {
   long raw1 = readStable(scale1);
   long raw2 = readStable(scale2);
-  float val1 = (raw1 - scale1.get_offset()) / scale1.get_scale();
-  float val2 = (raw2 - scale2.get_offset()) / scale2.get_scale();
-  float diff = val1 - val2;
+  #if DISPLAY_TYPE_OLED
+  if (raw1 == 0 || raw2 == 0) {
+    showStatus("Load cells", "not ready");
+    return;
+  }
+  #endif
+  float val1 = (raw1 - scale1.get_offset()) / calFactor1;
+  float val2 = (raw2 - scale2.get_offset()) / calFactor2;
 
-  Serial.printf("S1: %.2f\tS2: %.2f\tDiff: %.2f\n", val1, val2, diff);
-  Display::clear();
-  Display::printLine(0, String("Scale1: ") + val1);
-  Display::printLine(16, String("Scale2: ") + val2);
-  Display::printLine(32, String("Diff: ") + diff);
+  // Precompute strings (fixed positions):
+  String l0 = String("Static Weight: ") + String((val1 + val2) / 28.35, 2);
+  String l1 = String("BP: ") + String(calculate_BP());
+  String l2 = String("ESW: ") + String(estimate_MOI());
+  String l3 = String("Handle Mass: ") + String(val2, 2);
+  String l4 = String("Head Mass: ") + String(val1, 2);
+
+  // Static cache of last-drawn text to decide what to repaint
+  static String p0, p1, p2, p3, p4;
+
+  auto drawLineIfChanged = [&](int y, const String& now, String& prev) {
+  #if DISPLAY_TYPE_OLED
+    if (now == prev) return;            // no repaint needed
+    // Erase only this row area (full width)
+    display.fillRect(0, y, 128, 10, BLACK);
+    display.setCursor(0, y);
+    display.setTextColor(WHITE);
+    display.print(now);
+  #else
+    // For TFT, just reprint (cheap enough at 2s cadence)
+    tft.fillRect(0, y, 240, 20, TFT_BLACK);
+    tft.setCursor(4, y);
+    tft.print(now);
+  #endif
+    prev = now;
+  };
+
+  drawLineIfChanged(0,  l0, p0);
+  drawLineIfChanged(16, l1, p1);
+  drawLineIfChanged(32, l2, p2);
+  drawLineIfChanged(48, l3, p3);
+  drawLineIfChanged(56, l4, p4);
+
+  // Push the buffer ONCE (OLED)
+  #if DISPLAY_TYPE_OLED
+    display.display();
+  #endif
 
   lastVal1 = val1;
   lastVal2 = val2;
   lastUpdate = millis();
 }
 
-void handleButtonPress() {
-  if (nextActionIsWrite) {
-    long diff = (long)(lastVal1 - lastVal2);
-    String diffStr = String(diff);
-    Serial.printf("Writing diff=%ld\n", diff);
-    showStatus("NFC: Tap tag to write...");
-    String err;
-    bool ok = rfid2WriteText(String("DS:") + diffStr, &err);
-    if (ok) {
-      showStatus(String("Write OK: diff=") + diffStr);
-      Serial.printf("Write OK: diff=%ld\n", diff);
-      nextActionIsWrite = false;
-    } else {
-      showStatus(String("Write FAIL: ") + err);
-      Serial.println("Write FAIL: " + err);
-      if (err != "timeout")
-        nextActionIsWrite = false;
-    }
+void tare() {
+  showStatus("Taring...");
+  if (scale1.wait_ready_timeout(1000)) {
+    scale1.tare();
   } else {
-    showStatus("NFC: Tap tag to read...");
+    Serial.println("scale1 tare timeout");
+  }
+  if (scale2.wait_ready_timeout(1000)) {
+    scale2.tare();
+  } else {
+    Serial.println("scale2 tare timeout");
+  }
+  saveCalibration();
+  showStatus("Tare done");
+}
+
+// NOTE: write-once per presence edge
+void pollNfcAndWrite() {
+  bool present = false;
+#ifdef ARDUINO
+  // If your Rfid2.h exposes a presence checker, use it:
+  present = waitForCard(100);
+#endif
+
+  // On rising edge of presence -> read command or write diff
+  if (present && !nfcWasPresent) {
     String text;
     String err;
-    bool ok = rfid2ReadText(&text, &err);
-    if (ok && text.startsWith("DS:")) {
-      String diffStr = text.substring(3);
-      showStatus(String("Read: diff=") + diffStr);
-      Serial.println("Read: diff=" + diffStr);
-      nextActionIsWrite = true;
-    } else {
-      if (!ok) {
-        if (err == "timeout") {
-          showStatus("Read FAIL: timeout");
-          Serial.println("Read FAIL: timeout");
-        } else {
-          showStatus(String("Read FAIL: ") + err);
-          Serial.println("Read FAIL: " + err);
-          nextActionIsWrite = true;
-        }
-      } else {
-        showStatus("Read FAIL: no DS record");
-        Serial.println("Read FAIL: no DS record");
-        nextActionIsWrite = true;
+    bool handled = false;
+    if (rfid2ReadText(&text, &err, false)) {
+
+
+      text.trim();
+      text.toUpperCase();
+      if (text == "CAL") {
+        showStatus("NFC cmd: CAL");
+        calibrate();
+        handled = true;
+      } else if (text == "TARE") {
+        showStatus("NFC cmd: TARE");
+        tare();
+        handled = true;
       }
     }
+
+    if (!handled) {
+      long diff = (long)(lastVal1 - lastVal2);
+      String diffStr = String(diff);
+      bool ok = rfid2WriteText(String("DS:") + diffStr, &err);
+      if (ok) {
+        showStatus("NFC write OK", String("diff=") + diffStr);
+        Serial.printf("NFC write OK: diff=%ld\n", diff);
+      } else {
+        showStatus("NFC write FAIL", err);
+        Serial.println("NFC write FAIL: " + err);
+      }
+    } else {
+      rfid2Halt();
+
+    }
   }
+
+  nfcWasPresent = present;
+}
+
+void perform_test() {
+  // TODO: implement test routine
+}
+
+float calculate_BP() {
+  float head = lastVal1 / 28.35;
+  float handle = lastVal2 / 28.35;
+  return (2 * handle + 13 * head) / (head + handle);
+}
+
+float estimate_MOI() {
+  return (calculate_BP() * 25.4) / (2.08);
+}
+
+void calibrate() {
+  tare();
+
+  float weights[4] = {0.0f, 100.0f, 200.0f, 300.0f};
+  long readings1[4];
+  long readings2[4];
+  readings1[0] = scale1.get_offset();
+  readings2[0] = scale2.get_offset();
+
+  for (int i = 1; i < 4; ++i) {
+    showStatus(String("Place ") + (int)weights[i] + "g on scale 1", "then present card");
+    while (!waitForCard()) {
+      // keep waiting for any card
+    }
+    rfid2Halt();
+    readings1[i] = readStable(scale1);
+  }
+
+  for (int i = 1; i < 4; ++i) {
+    showStatus(String("Place ") + (int)weights[i] + "g on scale 2", "then present card");
+    while (!waitForCard()) {
+      // keep waiting for any card
+    }
+    rfid2Halt();
+    readings2[i] = readStable(scale2);
+  }
+
+  float sumW = 0.0f, sumR = 0.0f;
+  for (int i = 0; i < 4; ++i) { sumW += weights[i]; sumR += readings1[i]; }
+  float meanW = sumW / 4.0f; float meanR = sumR / 4.0f;
+  float num = 0.0f, den = 0.0f;
+  for (int i = 0; i < 4; ++i) { num += (weights[i] - meanW) * (readings1[i] - meanR); den += (weights[i] - meanW) * (weights[i] - meanW); }
+  calFactor1 = num / den; long offset1 = (long)(meanR - calFactor1 * meanW);
+  scale1.set_scale(calFactor1); scale1.set_offset(offset1);
+
+  sumW = 0.0f; sumR = 0.0f; num = 0.0f; den = 0.0f;
+  for (int i = 0; i < 4; ++i) { sumW += weights[i]; sumR += readings2[i]; }
+  meanW = sumW / 4.0f; meanR = sumR / 4.0f;
+  for (int i = 0; i < 4; ++i) { num += (weights[i] - meanW) * (readings2[i] - meanR); den += (weights[i] - meanW) * (weights[i] - meanW); }
+  calFactor2 = num / den; long offset2 = (long)(meanR - calFactor2 * meanW);
+  scale2.set_scale(calFactor2); scale2.set_offset(offset2);
+
+  saveCalibration();
+  showStatus("Calibration", "complete");
 }
 
 void loadCalibration() {
