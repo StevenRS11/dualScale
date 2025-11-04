@@ -13,10 +13,10 @@
 
 #define OLED_ADDR 0x3C
 
-#define LOADCELL_DOUT1 5   // Adjust pins for your wiring
-#define LOADCELL_SCK1  4
-#define LOADCELL_DOUT2 41
-#define LOADCELL_SCK2  40
+#define LOADCELL_DOUT2 5   // Adjust pins for your wiring
+#define LOADCELL_SCK2  4
+#define LOADCELL_DOUT1 41
+#define LOADCELL_SCK1  40
 
 #include <Arduino.h>
 #include <HX711.h>
@@ -247,7 +247,6 @@ void tare() {
   } else {
     Serial.println("scale2 tare timeout");
   }
-  saveCalibration();
   showStatus("Tare done");
 }
 
@@ -360,25 +359,49 @@ void calibrate() {
   showStatus("Calibration", "complete");
 }
 
+void saveCalibration() {
+  if (!prefs.begin("dualScale", false)) {
+    Serial.println("[NVS] begin(rw) failed");
+    return;
+  }
+  size_t w1 = prefs.putFloat("cal1", calFactor1);
+  size_t w2 = prefs.putFloat("cal2", calFactor2);
+  size_t w3 = prefs.putLong("tare1", scale1.get_offset());
+  size_t w4 = prefs.putLong("tare2", scale2.get_offset());
+
+  float  rc1 = prefs.getFloat("cal1", NAN);
+  float  rc2 = prefs.getFloat("cal2", NAN);
+  long   ro1 = prefs.getLong("tare1", LONG_MIN);
+  long   ro2 = prefs.getLong("tare2", LONG_MIN);
+
+  prefs.end();
+
+  Serial.printf("[NVS] saved bytes: cal1=%u cal2=%u tare1=%u tare2=%u\n",
+                (unsigned)w1,(unsigned)w2,(unsigned)w3,(unsigned)w4);
+  Serial.printf("[NVS] saved values: cal1=%.6f cal2=%.6f tare1=%ld tare2=%ld\n",
+                rc1, rc2, ro1, ro2);
+}
+
 void loadCalibration() {
-  prefs.begin("dualScale", false);
+  if (!prefs.begin("dualScale", true)) {
+    Serial.println("[NVS] begin(ro) failed");
+    return;
+  }
+
   calFactor1 = prefs.getFloat("cal1", 1.0f);
   calFactor2 = prefs.getFloat("cal2", 1.0f);
   long offset1 = prefs.getLong("tare1", 0);
   long offset2 = prefs.getLong("tare2", 0);
+
   prefs.end();
 
   scale1.set_scale(calFactor1);
   scale2.set_scale(calFactor2);
   scale1.set_offset(offset1);
   scale2.set_offset(offset2);
+
+  Serial.printf("[NVS] loaded values: cal1=%.6f cal2=%.6f tare1=%ld tare2=%ld\n",
+                calFactor1, calFactor2, offset1, offset2);
 }
 
-void saveCalibration() {
-  prefs.begin("dualScale", false);
-  prefs.putFloat("cal1", calFactor1);
-  prefs.putFloat("cal2", calFactor2);
-  prefs.putLong("tare1", scale1.get_offset());
-  prefs.putLong("tare2", scale2.get_offset());
-  prefs.end();
-}
+
