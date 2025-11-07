@@ -17,7 +17,7 @@
 #define LOADCELL_DOUT2 5   // Adjust pins for your wiring
 #define LOADCELL_SCK2  4
 #define LOADCELL_DOUT1 41
-#define LOADCELL_SCK1  40
+#define LOADCELL_SCK1  42
 
 #define BUTTON  6
 
