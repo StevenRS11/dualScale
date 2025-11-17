@@ -9,15 +9,37 @@ static bool initialized = false;
 
 bool rfid2Begin(TwoWire &w) {
   RFID2_DEBUG_PRINT("rfid2Begin: start\n");
-  w.begin();
-  rfid.PCD_Init(); // Initialize MFRC522
-  RFID2_DEBUG_PRINT("rfid2Begin: initialized\n");
+  // Note: Wire.begin() should be called with correct pins BEFORE calling this function
 
+  // Check if RFID module is present on I2C bus
+  w.beginTransmission(0x28);
+  if (w.endTransmission() != 0) {
+    RFID2_DEBUG_PRINT("rfid2Begin: RFID module not found at 0x28\n");
+    return false;
+  }
+
+  rfid.PCD_Init(); // Initialize MFRC522
+
+  // Verify initialization by reading version register
+  byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
+  RFID2_DEBUG_PRINT("rfid2Begin: version register = 0x%02X\n", version);
+
+  // MFRC522 version should be 0x91 or 0x92
+  if (version != 0x91 && version != 0x92) {
+    RFID2_DEBUG_PRINT("rfid2Begin: unexpected version (expected 0x91/0x92, got 0x%02X)\n", version);
+    return false;
+  }
+
+  RFID2_DEBUG_PRINT("rfid2Begin: initialized successfully\n");
   initialized = true;
-  return true; // Library does not expose an error code
+  return true;
 }
 
  bool waitForCard(int wait) {
+  if (!initialized) {
+    RFID2_DEBUG_PRINT("waitForCard: not initialized\n");
+    return false;
+  }
   RFID2_DEBUG_PRINT("waitForCard: waiting for tag\n");
   unsigned long start = millis();
   while (true) {

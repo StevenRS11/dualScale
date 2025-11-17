@@ -188,8 +188,14 @@ void updateReadings() {
   long raw1 = readStable(scale1);
   long raw2 = readStable(scale2);
   #if DISPLAY_TYPE_OLED
-  if (raw1 == 0 || raw2 == 0) {
+  if (raw1 == 0 && raw2 == 0) {
     showStatus("Load cells", "not ready");
+    return;
+  } else if (raw1 == 0) {
+    showStatus("Scale 1 (head)", "not ready");
+    return;
+  } else if (raw2 == 0) {
+    showStatus("Scale 2 (handle)", "not ready");
     return;
   }
   #endif
