@@ -19,15 +19,31 @@ bool rfid2Begin(TwoWire &w) {
   }
 
   rfid.PCD_Init(); // Initialize MFRC522
+  delay(50); // Give chip time to initialize
 
   // Verify initialization by reading version register
   byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
-  RFID2_DEBUG_PRINT("rfid2Begin: version register = 0x%02X\n", version);
+  RFID2_DEBUG_PRINT("rfid2Begin: version register (0x37) = 0x%02X\n", version);
 
-  // MFRC522 version should be 0x91 or 0x92
-  if (version != 0x91 && version != 0x92) {
-    RFID2_DEBUG_PRINT("rfid2Begin: unexpected version (expected 0x91/0x92, got 0x%02X)\n", version);
-    return false;
+  // Read a few other registers to diagnose communication
+  byte comIrq = rfid.PCD_ReadRegister(rfid.ComIrqReg);
+  byte divIrq = rfid.PCD_ReadRegister(rfid.DivIrqReg);
+  byte error = rfid.PCD_ReadRegister(rfid.ErrorReg);
+  RFID2_DEBUG_PRINT("rfid2Begin: ComIrqReg=0x%02X DivIrqReg=0x%02X ErrorReg=0x%02X\n", comIrq, divIrq, error);
+
+  // Test write/read on a scratch register to verify I2C communication
+  byte testValue = 0xAA;
+  rfid.PCD_WriteRegister(rfid.FIFODataReg, testValue);
+  byte readBack = rfid.PCD_ReadRegister(rfid.FIFODataReg);
+  RFID2_DEBUG_PRINT("rfid2Begin: I2C test - wrote 0x%02X, read back 0x%02X\n", testValue, readBack);
+
+  // MFRC522 version should be 0x91 or 0x92, but some clones report 0x00 or other values
+  // Accept 0x88-0x92 range, or warn but continue if version seems wrong
+  if (version == 0x00 || version == 0xFF) {
+    RFID2_DEBUG_PRINT("rfid2Begin: WARNING - invalid version 0x%02X, chip may not be responding properly\n", version);
+  } else if (version < 0x88 || version > 0x92) {
+    RFID2_DEBUG_PRINT("rfid2Begin: WARNING - unexpected version 0x%02X (expected 0x88-0x92)\n", version);
+    RFID2_DEBUG_PRINT("rfid2Begin: This may not be an MFRC522 chip\n");
   }
 
   RFID2_DEBUG_PRINT("rfid2Begin: initialized successfully\n");

@@ -17,7 +17,7 @@
 #define LOADCELL_DOUT2 5   // Adjust pins for your wiring
 #define LOADCELL_SCK2  4
 #define LOADCELL_DOUT1 41
-#define LOADCELL_SCK1  42
+#define LOADCELL_SCK1  40
 
 #define BUTTON  6
 
@@ -199,8 +199,32 @@ void updateReadings() {
     return;
   }
   #endif
+  // Validate calibration factors to prevent NaN
+  if (calFactor1 < 0.1f || calFactor1 > 1000000.0f || isnan(calFactor1) || isinf(calFactor1)) {
+    showStatus("Invalid cal", "Scale 1 - recal");
+    Serial.printf("Invalid calFactor1: %.2f\n", calFactor1);
+    return;
+  }
+  if (calFactor2 < 0.1f || calFactor2 > 1000000.0f || isnan(calFactor2) || isinf(calFactor2)) {
+    showStatus("Invalid cal", "Scale 2 - recal");
+    Serial.printf("Invalid calFactor2: %.2f\n", calFactor2);
+    return;
+  }
+
   float val1 = (raw1 - scale1.get_offset()) / calFactor1;
   float val2 = (raw2 - scale2.get_offset()) / calFactor2;
+
+  // Check for invalid results
+  if (isnan(val1) || isinf(val1)) {
+    showStatus("Scale 1 error", "NaN/Inf result");
+    Serial.printf("Scale 1 invalid result: %.2f\n", val1);
+    return;
+  }
+  if (isnan(val2) || isinf(val2)) {
+    showStatus("Scale 2 error", "NaN/Inf result");
+    Serial.printf("Scale 2 invalid result: %.2f\n", val2);
+    return;
+  }
 
   // Precompute strings (fixed positions):
   String l0 = String("Static Weight: ") + String((val1 + val2) / 28.35, 2);
@@ -350,20 +374,64 @@ void calibrate() {
     readings2[i] = readStable(scale2);
   }
 
+  // Calculate calibration factor for scale 1
   float sumW = 0.0f, sumR = 0.0f;
   for (int i = 0; i < 4; ++i) { sumW += weights[i]; sumR += readings1[i]; }
   float meanW = sumW / 4.0f; float meanR = sumR / 4.0f;
   float num = 0.0f, den = 0.0f;
-  for (int i = 0; i < 4; ++i) { num += (weights[i] - meanW) * (readings1[i] - meanR); den += (weights[i] - meanW) * (weights[i] - meanW); }
-  calFactor1 = num / den; long offset1 = (long)(meanR - calFactor1 * meanW);
-  scale1.set_scale(calFactor1); scale1.set_offset(offset1);
+  for (int i = 0; i < 4; ++i) {
+    num += (weights[i] - meanW) * (readings1[i] - meanR);
+    den += (weights[i] - meanW) * (weights[i] - meanW);
+  }
 
+  if (den < 0.001f || isnan(den) || isnan(num)) {
+    showStatus("Cal failed!", "Scale 1 bad data");
+    Serial.printf("Scale 1 calibration failed: num=%.2f den=%.2f\n", num, den);
+    delay(2000);
+    return;
+  }
+
+  calFactor1 = num / den;
+  if (calFactor1 < 0.1f || calFactor1 > 1000000.0f || isnan(calFactor1)) {
+    showStatus("Cal failed!", "Scale 1 invalid");
+    Serial.printf("Scale 1 invalid factor: %.2f\n", calFactor1);
+    delay(2000);
+    return;
+  }
+
+  long offset1 = (long)(meanR - calFactor1 * meanW);
+  scale1.set_scale(calFactor1);
+  scale1.set_offset(offset1);
+  Serial.printf("Scale 1: calFactor=%.2f offset=%ld\n", calFactor1, offset1);
+
+  // Calculate calibration factor for scale 2
   sumW = 0.0f; sumR = 0.0f; num = 0.0f; den = 0.0f;
   for (int i = 0; i < 4; ++i) { sumW += weights[i]; sumR += readings2[i]; }
   meanW = sumW / 4.0f; meanR = sumR / 4.0f;
-  for (int i = 0; i < 4; ++i) { num += (weights[i] - meanW) * (readings2[i] - meanR); den += (weights[i] - meanW) * (weights[i] - meanW); }
-  calFactor2 = num / den; long offset2 = (long)(meanR - calFactor2 * meanW);
-  scale2.set_scale(calFactor2); scale2.set_offset(offset2);
+  for (int i = 0; i < 4; ++i) {
+    num += (weights[i] - meanW) * (readings2[i] - meanR);
+    den += (weights[i] - meanW) * (weights[i] - meanW);
+  }
+
+  if (den < 0.001f || isnan(den) || isnan(num)) {
+    showStatus("Cal failed!", "Scale 2 bad data");
+    Serial.printf("Scale 2 calibration failed: num=%.2f den=%.2f\n", num, den);
+    delay(2000);
+    return;
+  }
+
+  calFactor2 = num / den;
+  if (calFactor2 < 0.1f || calFactor2 > 1000000.0f || isnan(calFactor2)) {
+    showStatus("Cal failed!", "Scale 2 invalid");
+    Serial.printf("Scale 2 invalid factor: %.2f\n", calFactor2);
+    delay(2000);
+    return;
+  }
+
+  long offset2 = (long)(meanR - calFactor2 * meanW);
+  scale2.set_scale(calFactor2);
+  scale2.set_offset(offset2);
+  Serial.printf("Scale 2: calFactor=%.2f offset=%ld\n", calFactor2, offset2);
 
   saveCalibration();
   showStatus("Calibration", "complete");
@@ -404,6 +472,18 @@ void loadCalibration() {
   long offset2 = prefs.getLong("tare2", 0);
 
   prefs.end();
+
+  // Validate loaded calibration factors
+  if (isnan(calFactor1) || isinf(calFactor1) || calFactor1 < 0.1f || calFactor1 > 1000000.0f) {
+    Serial.printf("[NVS] Invalid cal1=%.6f, resetting to 1.0\n", calFactor1);
+    calFactor1 = 1.0f;
+    offset1 = 0;
+  }
+  if (isnan(calFactor2) || isinf(calFactor2) || calFactor2 < 0.1f || calFactor2 > 1000000.0f) {
+    Serial.printf("[NVS] Invalid cal2=%.6f, resetting to 1.0\n", calFactor2);
+    calFactor2 = 1.0f;
+    offset2 = 0;
+  }
 
   scale1.set_scale(calFactor1);
   scale2.set_scale(calFactor2);
