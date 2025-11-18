@@ -12,13 +12,23 @@ bool rfid2Begin(TwoWire &w) {
   // Note: Wire.begin() should be called with correct pins BEFORE calling this function
 
   // Check if RFID module is present on I2C bus
+  RFID2_DEBUG_PRINT("rfid2Begin: checking I2C presence at 0x28\n");
+  yield(); // Feed watchdog
   w.beginTransmission(0x28);
-  if (w.endTransmission() != 0) {
+  byte i2cError = w.endTransmission();
+  RFID2_DEBUG_PRINT("rfid2Begin: I2C endTransmission returned %d\n", i2cError);
+
+  if (i2cError != 0) {
     RFID2_DEBUG_PRINT("rfid2Begin: RFID module not found at 0x28\n");
     return false;
   }
 
+  RFID2_DEBUG_PRINT("rfid2Begin: calling PCD_Init()\n");
+  yield(); // Feed watchdog
   rfid.PCD_Init(); // Initialize MFRC522
+  RFID2_DEBUG_PRINT("rfid2Begin: PCD_Init() completed\n");
+
+  yield(); // Feed watchdog
   delay(50); // Give chip time to initialize
 
   // Verify initialization by reading version register

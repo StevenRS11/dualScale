@@ -123,7 +123,30 @@ void showStatus(const String &line1, const String &line2 = String()) {
 
 void setup() {
   Serial.begin(115200);
+  delay(100); // Let serial stabilize
   Serial.println("Init start");
+
+  // Check for repeated boot loops (crash detection)
+  if (!prefs.begin("dualScale", false)) {
+    Serial.println("[NVS] begin() failed in setup");
+  } else {
+    uint32_t bootCount = prefs.getUInt("bootCount", 0);
+    bootCount++;
+    prefs.putUInt("bootCount", bootCount);
+    Serial.printf("Boot count: %u\n", bootCount);
+
+    // If we've rebooted 3+ times rapidly, clear calibration
+    if (bootCount >= 3) {
+      Serial.println("Multiple rapid boots detected - clearing calibration!");
+      prefs.remove("cal1");
+      prefs.remove("cal2");
+      prefs.remove("tare1");
+      prefs.remove("tare2");
+      prefs.putUInt("bootCount", 0);
+    }
+    prefs.end();
+  }
+
   Serial.println("Display Init start");
   Display::begin();
   Serial.println("Display Init finish");
@@ -140,11 +163,20 @@ void setup() {
 
 
   // Load cells
+  Serial.println("Load cells init");
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
 
   tare();
   loadCalibration();
+
+  // If we made it here, clear boot count (successful boot)
+  if (prefs.begin("dualScale", false)) {
+    prefs.putUInt("bootCount", 0);
+    prefs.end();
+  }
+
+  Serial.println("Setup complete");
 }
 
 void loop() {
