@@ -57,6 +57,11 @@ bool nfcWasPresent = false;                  // edge-detect so we only write onc
 
 float lastVal1 = 0.0f;
 float lastVal2 = 0.0f;
+
+// Button state for 3-second hold to tare
+unsigned long buttonPressStart = 0;
+bool buttonWasPressed = false;
+const unsigned long BUTTON_HOLD_TIME = 3000;  // 3 seconds
  
 long readStable(HX711 &scale);
 void updateReadings();
@@ -66,6 +71,7 @@ void tare();
 void calibrate();
 void perform_test();
 void pollNfcAndWrite();
+void waitForButtonPress();
 
 namespace Display {
   void begin() {
@@ -126,6 +132,15 @@ void setup() {
   delay(100); // Let serial stabilize
   Serial.println("Init start");
 
+  // Configure button pin with internal pull-up
+  pinMode(BUTTON, INPUT_PULLUP);
+
+  // Check if button is held down during boot -> enter calibration mode
+  bool calibrationMode = (digitalRead(BUTTON) == LOW);
+  if (calibrationMode) {
+    Serial.println("Button held during boot - will enter calibration mode after init");
+  }
+
   // Check for repeated boot loops (crash detection)
   if (!prefs.begin("dualScale", false)) {
     Serial.println("[NVS] begin() failed in setup");
@@ -177,9 +192,42 @@ void setup() {
   }
 
   Serial.println("Setup complete");
+
+  // Enter calibration mode if button was held during boot
+  if (calibrationMode) {
+    delay(500);  // Wait for button to be released
+    while (digitalRead(BUTTON) == LOW) {
+      delay(10);  // Wait for user to release button
+    }
+    Serial.println("Entering calibration mode...");
+    calibrate();
+  }
 }
 
 void loop() {
+  // Button monitoring: hold for 3 seconds to tare
+  bool buttonPressed = (digitalRead(BUTTON) == LOW);
+
+  if (buttonPressed && !buttonWasPressed) {
+    // Button just pressed - start timer
+    buttonPressStart = millis();
+    buttonWasPressed = true;
+  } else if (buttonPressed && buttonWasPressed) {
+    // Button still held - check if held long enough
+    if (millis() - buttonPressStart >= BUTTON_HOLD_TIME) {
+      Serial.println("Button held for 3 seconds - taring...");
+      tare();
+      // Wait for button release to prevent repeated tare
+      while (digitalRead(BUTTON) == LOW) {
+        delay(10);
+      }
+      buttonWasPressed = false;
+    }
+  } else if (!buttonPressed && buttonWasPressed) {
+    // Button released before 3 seconds
+    buttonWasPressed = false;
+  }
+
   // Periodic readings + display
   if (millis() - lastUpdate >= updateInterval) {
      updateReadings();
@@ -369,6 +417,18 @@ void perform_test() {
   // TODO: implement test routine
 }
 
+void waitForButtonPress() {
+  // Wait for button to be pressed
+  while (digitalRead(BUTTON) == HIGH) {
+    delay(10);
+  }
+  // Wait for button to be released
+  while (digitalRead(BUTTON) == LOW) {
+    delay(10);
+  }
+  delay(50);  // Debounce
+}
+
 float calculate_BP() {
   float head = lastVal1 / 28.35;
   float handle = lastVal2 / 28.35;
@@ -389,20 +449,14 @@ void calibrate() {
   readings2[0] = scale2.get_offset();
 
   for (int i = 1; i < 4; ++i) {
-    showStatus(String("Place ") + (int)weights[i] + "g on scale 1", "then present card");
-    while (!waitForCard()) {
-      // keep waiting for any card
-    }
-    rfid2Halt();
+    showStatus(String("Place ") + (int)weights[i] + "g on scale 1", "then press button");
+    waitForButtonPress();
     readings1[i] = readStable(scale1);
   }
 
   for (int i = 1; i < 4; ++i) {
-    showStatus(String("Place ") + (int)weights[i] + "g on scale 2", "then present card");
-    while (!waitForCard()) {
-      // keep waiting for any card
-    }
-    rfid2Halt();
+    showStatus(String("Place ") + (int)weights[i] + "g on scale 2", "then press button");
+    waitForButtonPress();
     readings2[i] = readStable(scale2);
   }
 
