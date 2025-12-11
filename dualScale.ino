@@ -9,17 +9,17 @@
 #define DISPLAY_TYPE_OLED  1
 
 #define I2C_SDA       8
-#define I2C_SCL       9
+#define I2C_SCL       7
 
 
 #define OLED_ADDR 0x3C
 
-#define LOADCELL_DOUT2 5   // Adjust pins for your wiring
-#define LOADCELL_SCK2  4
-#define LOADCELL_DOUT1 41
-#define LOADCELL_SCK1  40
+#define LOADCELL_DOUT2 6   // Adjust pins for your wiring
+#define LOADCELL_SCK2  5
+#define LOADCELL_DOUT1 3
+#define LOADCELL_SCK1  4
 
-#define BUTTON  6
+#define BUTTON  9
 
 
 #include <Arduino.h>
