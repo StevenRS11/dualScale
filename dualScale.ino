@@ -8,8 +8,13 @@
 #define DISPLAY_TYPE_TFT   0
 #define DISPLAY_TYPE_OLED  1
 
-#define I2C_SDA       8
-#define I2C_SCL       7
+// Screen I2C pins (OLED)
+#define SCREEN_SDA    8
+#define SCREEN_SCL    7
+
+// RFID I2C pins
+#define RFID_SDA      10
+#define RFID_SCL      11
 
 
 #define OLED_ADDR 0x3C
@@ -28,16 +33,19 @@
 
 #include "Rfid2.h"  // assumes: bool rfid2IsTagPresent(); bool rfid2WriteText(const String&, String* err);
 
+// Include Wire library - Wire and Wire1 are both available on ESP32
+#include <Wire.h>
+
 #if DISPLAY_TYPE_TFT
   #include <SPI.h>
   #include <TFT_eSPI.h>
   TFT_eSPI tft = TFT_eSPI();
 #elif DISPLAY_TYPE_OLED
-  #include <Wire.h>
   #include <Adafruit_GFX.h>
   #include <Adafruit_SSD1306.h>
   #define SCREEN_WIDTH 128
   #define SCREEN_HEIGHT 64
+  // Wire is used for the screen, Wire1 for RFID (both pre-defined by ESP32)
   Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #endif
 
@@ -82,7 +90,8 @@ namespace Display {
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextDatum(TL_DATUM);
   #elif DISPLAY_TYPE_OLED
-    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.begin(SCREEN_SDA, SCREEN_SCL);
+    Wire.setClock(400000);
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
       Serial.println(F("SSD1306 allocation failed"));
       for (;;)
@@ -166,12 +175,12 @@ void setup() {
   Display::begin();
   Serial.println("Display Init finish");
 
-  Wire.setClock(400000);
-
-  // NFC init
+  // NFC init - initialize RFID I2C bus
   Serial.println("RFID Init Start");
+  Wire1.begin(RFID_SDA, RFID_SCL);
+  Wire1.setClock(400000);
 
-  if (!rfid2Begin()) {
+  if (!rfid2Begin(Wire1)) {
     Serial.println("RFID2 init failed");
   }
   Serial.println("RFID Init Finish");
