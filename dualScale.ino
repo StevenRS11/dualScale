@@ -30,8 +30,9 @@
 #include <Arduino.h>
 #include <HX711.h>
 #include <Preferences.h>
+#include <PaddleDNA.h>
 
-#include "Rfid2.h"  // assumes: bool rfid2IsTagPresent(); bool rfid2WriteText(const String&, String* err);
+using namespace PaddleDNA;
 
 // Include Wire library - Wire and Wire1 are both available on ESP32
 #include <Wire.h>
@@ -53,23 +54,73 @@ HX711 scale1;
 HX711 scale2;
 Preferences prefs;
 
+// PaddleDNA Payload library
+NFC nfc;
+Crypto crypto;
+MeasurementAccumulator* accumulator = nullptr;
+
+// Machine credentials (TODO: load from NVS in production)
+const uint8_t MACHINE_UUID[16] = {
+  0x68, 0xdf, 0x84, 0x98, 0x85, 0x73, 0x46, 0xc6,
+  0xa8, 0xb8, 0xfe, 0xdc, 0xc0, 0xdf, 0x07, 0x36
+};
+
+const uint8_t PRIVATE_KEY[32] = {
+  0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
+  0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
+  0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
+  0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB
+};
+
 float calFactor1 = 1.0f;
 float calFactor2 = 1.0f;
 
-// NFC auto-polling state
+// Display update timing
 const unsigned long updateInterval = 2000;   // display + reading cadence
-const unsigned long nfcPollInterval = 2000;  // NFC presence check cadence
 unsigned long lastUpdate = 0;
-unsigned long lastNfcPoll = 0;
-bool nfcWasPresent = false;                  // edge-detect so we only write once per tap
 
 float lastVal1 = 0.0f;
 float lastVal2 = 0.0f;
 
-// Button state for 3-second hold to tare
+// Measurement workflow state machine
+enum MachineState {
+  IDLE,               // Live display mode
+  MEASURING,          // 4-second stabilization
+  DISPLAY_RESULTS,    // Show BP/ESW/Mass, prompt for NFC
+  WAITING_FOR_NFC,    // Polling for tag
+  WRITING_NFC,        // Writing measurements
+  WRITE_SUCCESS,      // Brief success message
+  WRITE_FAILED,       // Brief failure message
+  RETRY_PROMPT        // "Retry X/5" - waiting for tag re-presentation
+};
+
+MachineState currentState = IDLE;
+unsigned long stateStartTime = 0;
+uint32_t measurementTimestamp = 0;
+
+// Captured measurements
+float measuredHeadWeight = 0.0f;
+float measuredHandleWeight = 0.0f;
+float calculatedBalancePoint = 0.0f;
+float calculatedSwingWeight = 0.0f;
+float calculatedMass = 0.0f;
+
+// NFC retry tracking
+int nfcRetryCount = 0;
+const int MAX_NFC_RETRIES = 5;
+const unsigned long NFC_TIMEOUT = 30000;        // 30 seconds
+const unsigned long STABILIZATION_TIME = 4000;  // 4 seconds
+
+// Button state for short/long press detection
+enum ButtonState {
+  BTN_IDLE,
+  BTN_PRESSED,
+  BTN_HELD
+};
+
+ButtonState buttonState = BTN_IDLE;
 unsigned long buttonPressStart = 0;
-bool buttonWasPressed = false;
-const unsigned long BUTTON_HOLD_TIME = 3000;  // 3 seconds
+const unsigned long BUTTON_HOLD_TIME = 3000;
  
 long readStable(HX711 &scale);
 void updateReadings();
@@ -78,8 +129,16 @@ void loadCalibration();
 void tare();
 void calibrate();
 void perform_test();
-void pollNfcAndWrite();
 void waitForButtonPress();
+void handleIdleState();
+void handleMeasuringState();
+void handleDisplayResultsState();
+void handleWaitingForNfcState();
+void handleWritingNfcState();
+void handleWriteError(AccumulateResult result, const String& msg);
+void handleRetryPromptState();
+void handleWriteSuccessState();
+void handleWriteFailedState();
 
 namespace Display {
   void begin() {
@@ -175,16 +234,24 @@ void setup() {
   Display::begin();
   Serial.println("Display Init finish");
 
-  // NFC init - initialize RFID I2C bus
-  Serial.println("RFID Init Start");
+  // Initialize Payload library
+  Serial.println("Payload Init Start");
   Wire1.begin(RFID_SDA, RFID_SCL);
   Wire1.setClock(400000);
+  delay(100);  // Critical: stabilize I2C before NFC init
 
-  if (!rfid2Begin(Wire1)) {
-    Serial.println("RFID2 init failed");
+  if (!nfc.begin(Wire1)) {
+    Serial.println("NFC init failed");
+    showStatus("NFC Error", "Init failed");
   }
-  Serial.println("RFID Init Finish");
 
+  if (!crypto.begin(MACHINE_UUID, PRIVATE_KEY)) {
+    Serial.println("Crypto init failed");
+    showStatus("Crypto Error", "Init failed");
+  }
+
+  accumulator = new MeasurementAccumulator(nfc, crypto, 9);
+  Serial.println("Payload Init Finish");
 
   // Load cells
   Serial.println("Load cells init");
@@ -214,38 +281,289 @@ void setup() {
 }
 
 void loop() {
-  // Button monitoring: hold for 3 seconds to tare
+  // Button monitoring with short/long press detection
   bool buttonPressed = (digitalRead(BUTTON) == LOW);
 
-  if (buttonPressed && !buttonWasPressed) {
-    // Button just pressed - start timer
-    buttonPressStart = millis();
-    buttonWasPressed = true;
-  } else if (buttonPressed && buttonWasPressed) {
-    // Button still held - check if held long enough
-    if (millis() - buttonPressStart >= BUTTON_HOLD_TIME) {
-      Serial.println("Button held for 3 seconds - taring...");
-      tare();
-      // Wait for button release to prevent repeated tare
-      while (digitalRead(BUTTON) == LOW) {
-        delay(10);
+  switch (buttonState) {
+    case BTN_IDLE:
+      if (buttonPressed) {
+        buttonPressStart = millis();
+        buttonState = BTN_PRESSED;
       }
-      buttonWasPressed = false;
-    }
-  } else if (!buttonPressed && buttonWasPressed) {
-    // Button released before 3 seconds
-    buttonWasPressed = false;
+      break;
+
+    case BTN_PRESSED:
+      if (!buttonPressed) {
+        // Released before hold time - SHORT PRESS
+        if (currentState == IDLE) {
+          Serial.println("Short press - starting measurement");
+          currentState = MEASURING;
+          stateStartTime = millis();
+          measurementTimestamp = millis() / 1000;  // Simple timestamp
+        }
+        buttonState = BTN_IDLE;
+      } else if (millis() - buttonPressStart >= BUTTON_HOLD_TIME) {
+        // LONG PRESS - TARE
+        Serial.println("Long press - taring");
+        tare();
+        buttonState = BTN_HELD;
+      }
+      break;
+
+    case BTN_HELD:
+      if (!buttonPressed) {
+        buttonState = BTN_IDLE;
+      }
+      break;
   }
 
-  // Periodic readings + display
+  // State machine handler
+  switch (currentState) {
+    case IDLE:
+      handleIdleState();
+      break;
+    case MEASURING:
+      handleMeasuringState();
+      break;
+    case DISPLAY_RESULTS:
+      handleDisplayResultsState();
+      break;
+    case WAITING_FOR_NFC:
+      handleWaitingForNfcState();
+      break;
+    case WRITING_NFC:
+      handleWritingNfcState();
+      break;
+    case WRITE_SUCCESS:
+      handleWriteSuccessState();
+      break;
+    case WRITE_FAILED:
+      handleWriteFailedState();
+      break;
+    case RETRY_PROMPT:
+      handleRetryPromptState();
+      break;
+  }
+}
+
+void handleIdleState() {
+  // Existing live display behavior
   if (millis() - lastUpdate >= updateInterval) {
-     updateReadings();
+    updateReadings();
+  }
+}
+
+void handleMeasuringState() {
+  unsigned long elapsed = millis() - stateStartTime;
+
+  // Update display every 500ms with progress
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate >= 500) {
+    int dotsCount = (elapsed / 500) % 4;
+    String dots = "";
+    for (int i = 0; i < dotsCount; i++) dots += ".";
+
+    Display::clear();
+    Display::printLine(16, "Measuring" + dots);
+    Display::printLine(32, String(elapsed / 1000) + "s / 4s");
+    #if DISPLAY_TYPE_OLED
+      display.display();
+    #endif
+    lastDisplayUpdate = millis();
   }
 
-  // Periodic NFC polling (auto-write on presence edge)
-  if (millis() - lastNfcPoll >= nfcPollInterval) {
-     pollNfcAndWrite();
-     lastNfcPoll = millis();
+  // After 4 seconds, take final measurement
+  if (elapsed >= STABILIZATION_TIME) {
+    long raw1 = readStable(scale1);
+    long raw2 = readStable(scale2);
+
+    if (raw1 == 0 || raw2 == 0) {
+      showStatus("Measurement", "failed");
+      delay(2000);
+      currentState = IDLE;
+      lastUpdate = 0;
+      return;
+    }
+
+    // Capture measurements
+    measuredHeadWeight = (raw1 - scale1.get_offset()) / calFactor1;
+    measuredHandleWeight = (raw2 - scale2.get_offset()) / calFactor2;
+
+    // Calculate display values
+    lastVal1 = measuredHeadWeight;
+    lastVal2 = measuredHandleWeight;
+    calculatedBalancePoint = calculate_BP();
+    calculatedSwingWeight = estimate_MOI();
+    calculatedMass = (measuredHeadWeight + measuredHandleWeight) / 28.35;
+
+    Serial.printf("Measurements: Head=%.2fg Handle=%.2fg\n",
+                  measuredHeadWeight, measuredHandleWeight);
+
+    currentState = DISPLAY_RESULTS;
+    stateStartTime = millis();
+  }
+}
+
+void handleDisplayResultsState() {
+  // Display results and prompt for NFC
+  Display::clear();
+  Display::printLine(0, String("BP: ") + String(calculatedBalancePoint, 1));
+  Display::printLine(12, String("ESW: ") + String(calculatedSwingWeight, 1));
+  Display::printLine(24, String("Mass: ") + String(calculatedMass, 1));
+  Display::printLine(36, "");
+  Display::printLine(48, "Present NFC");
+  #if DISPLAY_TYPE_OLED
+    display.display();
+  #endif
+
+  // Immediately transition to waiting for NFC
+  currentState = WAITING_FOR_NFC;
+  stateStartTime = millis();
+  nfcRetryCount = 0;
+}
+
+void handleWaitingForNfcState() {
+  // Check for timeout
+  if (millis() - stateStartTime >= NFC_TIMEOUT) {
+    Serial.println("NFC timeout");
+    currentState = IDLE;
+    lastUpdate = 0;
+    return;
+  }
+
+  // Poll for tag every 250ms
+  static unsigned long lastPoll = 0;
+  if (millis() - lastPoll < 250) return;
+  lastPoll = millis();
+
+  if (nfc.waitForTag(100)) {
+    Serial.println("Tag detected");
+    currentState = WRITING_NFC;
+    stateStartTime = millis();
+  }
+}
+
+void handleWritingNfcState() {
+  Display::clear();
+  Display::printLine(24, "Writing...");
+  #if DISPLAY_TYPE_OLED
+    display.display();
+  #endif
+
+  // Create measurements
+  Measurement headMeasurement(
+    MeasurementType::HeadWeight,
+    MACHINE_UUID,
+    measurementTimestamp,
+    measuredHeadWeight
+  );
+
+  Measurement handleMeasurement(
+    MeasurementType::HandleWeight,
+    MACHINE_UUID,
+    measurementTimestamp,
+    measuredHandleWeight
+  );
+
+  // Write first measurement
+  String msg;
+  AccumulateResult result = accumulator->accumulate(headMeasurement, &msg);
+
+  if (result == AccumulateResult::Success) {
+    // Write second measurement
+    result = accumulator->accumulate(handleMeasurement, &msg);
+
+    if (result == AccumulateResult::Success) {
+      Serial.printf("Success! Tag has %d measurements\n",
+                    accumulator->getCurrentCount());
+      currentState = WRITE_SUCCESS;
+      stateStartTime = millis();
+      return;
+    }
+  }
+
+  // Handle errors
+  handleWriteError(result, msg);
+}
+
+void handleWriteError(AccumulateResult result, const String& msg) {
+  Serial.printf("Write error: %d - %s\n", (int)result, msg.c_str());
+
+  switch (result) {
+    case AccumulateResult::TagFull:
+      Display::clear();
+      Display::printLine(24, "Tag Full!");
+      #if DISPLAY_TYPE_OLED
+        display.display();
+      #endif
+      delay(2000);
+      currentState = IDLE;
+      lastUpdate = 0;
+      break;
+
+    default:
+      // Retry if under limit
+      if (nfcRetryCount < MAX_NFC_RETRIES) {
+        nfcRetryCount++;
+        currentState = RETRY_PROMPT;
+        stateStartTime = millis();
+      } else {
+        currentState = WRITE_FAILED;
+        stateStartTime = millis();
+      }
+      break;
+  }
+}
+
+void handleRetryPromptState() {
+  Display::clear();
+  Display::printLine(8, String("Retry ") + String(nfcRetryCount) + "/" + String(MAX_NFC_RETRIES));
+  Display::printLine(24, "Remove tag,");
+  Display::printLine(36, "then re-present");
+  #if DISPLAY_TYPE_OLED
+    display.display();
+  #endif
+
+  // Wait for tag removal then re-presentation
+  static bool tagWasRemoved = false;
+  static unsigned long lastCheck = 0;
+
+  if (millis() - lastCheck < 250) return;
+  lastCheck = millis();
+
+  if (!nfc.waitForTag(100)) {
+    tagWasRemoved = true;
+  } else if (tagWasRemoved) {
+    Serial.println("Tag re-presented - retrying");
+    tagWasRemoved = false;
+    currentState = WRITING_NFC;
+    stateStartTime = millis();
+  }
+}
+
+void handleWriteSuccessState() {
+  Display::clear();
+  Display::printLine(24, "Success!");
+  #if DISPLAY_TYPE_OLED
+    display.display();
+  #endif
+
+  if (millis() - stateStartTime >= 2000) {
+    currentState = IDLE;
+    lastUpdate = 0;
+  }
+}
+
+void handleWriteFailedState() {
+  Display::clear();
+  Display::printLine(24, "Failed");
+  #if DISPLAY_TYPE_OLED
+    display.display();
+  #endif
+
+  if (millis() - stateStartTime >= 3000) {
+    currentState = IDLE;
+    lastUpdate = 0;
   }
 }
 
@@ -371,55 +689,6 @@ void tare() {
     Serial.println("scale2 tare timeout");
   }
   showStatus("Tare done");
-}
-
-// NOTE: write-once per presence edge
-void pollNfcAndWrite() {
-  bool present = false;
-#ifdef ARDUINO
-  // If your Rfid2.h exposes a presence checker, use it:
-  present = waitForCard(100);
-#endif
-
-  // On rising edge of presence -> read command or write diff
-  if (present && !nfcWasPresent) {
-    String text;
-    String err;
-    bool handled = false;
-    if (rfid2ReadText(&text, &err, false)) {
-
-
-      text.trim();
-      text.toUpperCase();
-      if (text == "CAL") {
-        showStatus("NFC cmd: CAL");
-        calibrate();
-        handled = true;
-      } else if (text == "TARE") {
-        showStatus("NFC cmd: TARE");
-        tare();
-        handled = true;
-      }
-    }
-
-    if (!handled) {
-      long diff = (long)(lastVal1 - lastVal2);
-      String diffStr = String(diff);
-      bool ok = rfid2WriteText(String("DS:") + diffStr, &err);
-      if (ok) {
-        showStatus("NFC write OK", String("diff=") + diffStr);
-        Serial.printf("NFC write OK: diff=%ld\n", diff);
-      } else {
-        showStatus("NFC write FAIL", err);
-        Serial.println("NFC write FAIL: " + err);
-      }
-    } else {
-      rfid2Halt();
-
-    }
-  }
-
-  nfcWasPresent = present;
 }
 
 void perform_test() {
