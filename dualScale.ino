@@ -179,6 +179,7 @@ void setup() {
   Serial.println("RFID Init Start");
   Wire1.begin(RFID_SDA, RFID_SCL);
   Wire1.setClock(400000);
+  delay(100);  // Required delay after Wire.begin() for ESP32-S3 before RFID init
 
   if (!rfid2Begin(Wire1)) {
     Serial.println("RFID2 init failed");

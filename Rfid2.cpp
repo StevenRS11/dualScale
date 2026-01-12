@@ -19,7 +19,7 @@ bool rfid2Begin(TwoWire &w) {
   if (rfid != nullptr) {
     delete rfid;
   }
-  rfid = new MFRC522_I2C(0x28, 26, wireInstance);
+  rfid = new MFRC522_I2C(0x28, UINT8_MAX, wireInstance);  // UINT8_MAX disables hardware reset (pins 26-32 forbidden on ESP32-S3)
 
   // Check if RFID module is present on I2C bus
   RFID2_DEBUG_PRINT("rfid2Begin: checking I2C presence at 0x28\n");
