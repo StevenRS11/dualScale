@@ -9,7 +9,7 @@
 #define DISPLAY_TYPE_OLED  1
 
 // I2C pins (from schematic)
-#define SCREEN_SDA    6   // GP6
+#define SCREEN_SDA    8   // GP6
 #define SCREEN_SCL    7   // GP7
 
 // RFID I2C pins (separate bus)
@@ -308,10 +308,22 @@ void loop() {
         }
         buttonState = BTN_IDLE;
       } else if (millis() - buttonPressStart >= BUTTON_HOLD_TIME) {
-        // LONG PRESS - TARE
-        Serial.println("Long press - taring");
-        tare();
-        buttonState = BTN_HELD;
+        // LONG PRESS
+        if (currentState == IDLE) {
+          // In IDLE: TARE
+          Serial.println("Long press - taring");
+          tare();
+          buttonState = BTN_HELD;
+        } else {
+          // In any other state (NFC workflow): ABORT
+          Serial.println("Long press - aborting operation");
+          nfc.halt();  // Release tag if one is selected
+          showStatus("Cancelled");
+          delay(1000);
+          currentState = IDLE;
+          lastUpdate = 0;
+          buttonState = BTN_HELD;
+        }
       }
       break;
 
@@ -410,21 +422,27 @@ void handleMeasuringState() {
 }
 
 void handleDisplayResultsState() {
-  // Display results and prompt for NFC
-  Display::clear();
-  Display::printLine(0, String("BP: ") + String(calculatedBalancePoint, 1));
-  Display::printLine(12, String("ESW: ") + String(calculatedSwingWeight, 1));
-  Display::printLine(24, String("Mass: ") + String(calculatedMass, 1));
-  Display::printLine(36, "");
-  Display::printLine(48, "Present NFC");
-  #if DISPLAY_TYPE_OLED
-    display.display();
-  #endif
+  // Only update display once when first entering this state
+  static unsigned long lastStateEntry = 0;
 
-  // Immediately transition to waiting for NFC
-  currentState = WAITING_FOR_NFC;
-  stateStartTime = millis();
-  nfcRetryCount = 0;
+  if (stateStartTime != lastStateEntry) {
+    // Display results and prompt for NFC
+    Display::clear();
+    Display::printLine(0, String("BP: ") + String(calculatedBalancePoint, 1));
+    Display::printLine(12, String("ESW: ") + String(calculatedSwingWeight, 1));
+    Display::printLine(24, String("Mass: ") + String(calculatedMass, 1));
+    Display::printLine(36, "");
+    Display::printLine(48, "Present NFC");
+    #if DISPLAY_TYPE_OLED
+      display.display();
+    #endif
+    lastStateEntry = stateStartTime;
+
+    // Immediately transition to waiting for NFC
+    currentState = WAITING_FOR_NFC;
+    stateStartTime = millis();
+    nfcRetryCount = 0;
+  }
 }
 
 void handleWaitingForNfcState() {
@@ -441,62 +459,50 @@ void handleWaitingForNfcState() {
   if (millis() - lastPoll < 250) return;
   lastPoll = millis();
 
-  // Debug: show polling status
-  static int pollCount = 0;
-  pollCount++;
-  if (pollCount % 20 == 0) {  // Every 5 seconds (20 polls * 250ms)
-    unsigned long elapsed = (millis() - stateStartTime) / 1000;
-    Serial.printf("Waiting for NFC tag... (%lu seconds elapsed)\n", elapsed);
-  }
-
   if (nfc.waitForTag(100)) {
-    Serial.println("Tag detected");
+    Serial.println("Tag detected - writing measurements");
     currentState = WRITING_NFC;
     stateStartTime = millis();
   }
 }
 
 void handleWritingNfcState() {
-  Display::clear();
-  Display::printLine(24, "Writing...");
-  #if DISPLAY_TYPE_OLED
-    display.display();
-  #endif
+  // Only execute write logic once when first entering this state
+  static unsigned long lastStateEntry = 0;
 
-  // Create measurements
-  Measurement headMeasurement(
-    MeasurementType::HeadWeight,
-    MACHINE_UUID,
-    measurementTimestamp,
-    measuredHeadWeight
-  );
+  if (stateStartTime != lastStateEntry) {
+    // State just entered - update display and perform write
+    Display::clear();
+    Display::printLine(24, "Writing...");
+    #if DISPLAY_TYPE_OLED
+      display.display();
+    #endif
+    lastStateEntry = stateStartTime;
 
-  Measurement handleMeasurement(
-    MeasurementType::HandleWeight,
-    MACHINE_UUID,
-    measurementTimestamp,
-    measuredHandleWeight
-  );
+    // Create measurements array for batch write
+    Measurement measurements[2] = {
+      Measurement(MeasurementType::HeadWeight, MACHINE_UUID, measurementTimestamp, measuredHeadWeight),
+      Measurement(MeasurementType::HandleWeight, MACHINE_UUID, measurementTimestamp, measuredHandleWeight)
+    };
 
-  // Write first measurement
-  String msg;
-  AccumulateResult result = accumulator->accumulate(headMeasurement, &msg);
-
-  if (result == AccumulateResult::Success) {
-    // Write second measurement
-    result = accumulator->accumulate(handleMeasurement, &msg);
+    // Write both measurements atomically
+    String msg;
+    AccumulateResult result = accumulator->accumulateBatch(measurements, 2, &msg);
 
     if (result == AccumulateResult::Success) {
       Serial.printf("Success! Tag has %d measurements\n",
                     accumulator->getCurrentCount());
+      nfc.halt();  // Redundant but safe (accumulateBatch already halts)
       currentState = WRITE_SUCCESS;
       stateStartTime = millis();
       return;
     }
-  }
 
-  // Handle errors
-  handleWriteError(result, msg);
+    // Handle errors
+    nfc.halt();  // Redundant but safe (accumulateBatch already halts)
+    handleWriteError(result, msg);
+  }
+  // Else: Already processed this state entry, do nothing until state changes
 }
 
 void handleWriteError(AccumulateResult result, const String& msg) {
@@ -529,25 +535,37 @@ void handleWriteError(AccumulateResult result, const String& msg) {
 }
 
 void handleRetryPromptState() {
-  Display::clear();
-  Display::printLine(8, String("Retry ") + String(nfcRetryCount) + "/" + String(MAX_NFC_RETRIES));
-  Display::printLine(24, "Remove tag,");
-  Display::printLine(36, "then re-present");
-  #if DISPLAY_TYPE_OLED
-    display.display();
-  #endif
+  // Only update display once when first entering this state
+  static unsigned long lastStateEntry = 0;
+  static bool tagWasRemoved = false;
+
+  if (stateStartTime != lastStateEntry) {
+    // State just changed - redraw display
+    Display::clear();
+    Display::printLine(8, String("Retry ") + String(nfcRetryCount) + "/" + String(MAX_NFC_RETRIES));
+    Display::printLine(24, "Remove tag,");
+    Display::printLine(36, "then re-present");
+    #if DISPLAY_TYPE_OLED
+      display.display();
+    #endif
+
+    lastStateEntry = stateStartTime;
+    tagWasRemoved = false;  // Reset flag for new retry attempt
+  }
 
   // Wait for tag removal then re-presentation
-  static bool tagWasRemoved = false;
   static unsigned long lastCheck = 0;
-
   if (millis() - lastCheck < 250) return;
   lastCheck = millis();
 
   if (!nfc.waitForTag(100)) {
+    if (!tagWasRemoved) {
+      // Tag just removed - halt it
+      nfc.halt();
+    }
     tagWasRemoved = true;
   } else if (tagWasRemoved) {
-    Serial.println("Tag re-presented - retrying");
+    Serial.println("Tag re-presented - retrying write");
     tagWasRemoved = false;
     currentState = WRITING_NFC;
     stateStartTime = millis();
@@ -555,11 +573,17 @@ void handleRetryPromptState() {
 }
 
 void handleWriteSuccessState() {
-  Display::clear();
-  Display::printLine(24, "Success!");
-  #if DISPLAY_TYPE_OLED
-    display.display();
-  #endif
+  // Only update display once when first entering this state
+  static unsigned long lastStateEntry = 0;
+
+  if (stateStartTime != lastStateEntry) {
+    Display::clear();
+    Display::printLine(24, "Success!");
+    #if DISPLAY_TYPE_OLED
+      display.display();
+    #endif
+    lastStateEntry = stateStartTime;
+  }
 
   if (millis() - stateStartTime >= 2000) {
     currentState = IDLE;
@@ -568,11 +592,17 @@ void handleWriteSuccessState() {
 }
 
 void handleWriteFailedState() {
-  Display::clear();
-  Display::printLine(24, "Failed");
-  #if DISPLAY_TYPE_OLED
-    display.display();
-  #endif
+  // Only update display once when first entering this state
+  static unsigned long lastStateEntry = 0;
+
+  if (stateStartTime != lastStateEntry) {
+    Display::clear();
+    Display::printLine(24, "Failed");
+    #if DISPLAY_TYPE_OLED
+      display.display();
+    #endif
+    lastStateEntry = stateStartTime;
+  }
 
   if (millis() - stateStartTime >= 3000) {
     currentState = IDLE;

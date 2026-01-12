@@ -28,25 +28,26 @@ The system operates on two independent timers (both 2000ms):
 - `updateInterval`: Updates load cell readings and display every 2 seconds
 - `nfcPollInterval`: (Currently unused, to be replaced with Payload library)
 
-### Button Handling (Lines 217-238)
+### Button Handling (Lines 288-338)
 
-Current implementation uses state machine for long-press detection:
+Uses three-state button state machine (BTN_IDLE, BTN_PRESSED, BTN_HELD) for short/long press detection:
 
 ```cpp
 // Button state tracking
+ButtonState buttonState = BTN_IDLE;
 unsigned long buttonPressStart = 0;
-bool buttonWasPressed = false;
 const unsigned long BUTTON_HOLD_TIME = 3000;  // 3 seconds
-
-// States:
-// 1. Button pressed → start timer
-// 2. Button held ≥ 3s → trigger tare
-// 3. Button released < 3s → no action (available for new functionality)
 ```
 
-**Current Behavior:**
-- Long press (≥3 seconds): Triggers tare operation
-- Short press (<3 seconds): No action (available for integration)
+**Behavior depends on current machine state:**
+
+**When IDLE:**
+- Short press (<3 seconds): Start measurement cycle
+- Long press (≥3 seconds): Tare scales
+
+**When in NFC workflow (MEASURING, DISPLAY_RESULTS, WAITING_FOR_NFC, WRITING_NFC, RETRY_PROMPT):**
+- Short press (<3 seconds): Ignored
+- Long press (≥3 seconds): **Abort** - halts tag, shows "Cancelled", returns to IDLE
 
 ### Calibration System
 
@@ -242,7 +243,18 @@ Boot loop protection (lines 153-172, 197-201):
 3. Follow on-screen instructions for weight placement
 
 **Tare Scales:**
-- Hold button for 3 seconds during normal operation
+- Hold button for 3 seconds while in IDLE state (live display mode)
+
+**Take Measurement:**
+1. Short press button (release before 3 seconds)
+2. Wait for 4-second stabilization
+3. Results displayed with BP/ESW/Mass
+4. Present NFC tag when prompted
+5. Tag will be written with HeadWeight and HandleWeight measurements
+
+**Abort Measurement/NFC Write:**
+- Hold button for 3 seconds during any measurement or NFC operation
+- Tag will be released, operation cancelled, returns to IDLE
 
 **Read Values:**
-- Display automatically updates every 2 seconds
+- Display automatically updates every 2 seconds in IDLE state
