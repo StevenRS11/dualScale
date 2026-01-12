@@ -8,13 +8,13 @@
 #define DISPLAY_TYPE_TFT   0
 #define DISPLAY_TYPE_OLED  1
 
-// Screen I2C pins (OLED)
-#define SCREEN_SDA    8
-#define SCREEN_SCL    7
+// I2C pins (from schematic)
+#define SCREEN_SDA    6   // GP6
+#define SCREEN_SCL    7   // GP7
 
-// RFID I2C pins
-#define RFID_SDA      10
-#define RFID_SCL      11
+// RFID I2C pins (separate bus)
+#define RFID_SDA      10  // GP10
+#define RFID_SCL      11  // GP11
 
 
 #define OLED_ADDR 0x3C
@@ -240,14 +240,19 @@ void setup() {
   Wire1.setClock(400000);
   delay(100);  // Critical: stabilize I2C before NFC init
 
+  nfc.setDebug(true);  // Enable NFC debug output
   if (!nfc.begin(Wire1)) {
     Serial.println("NFC init failed");
     showStatus("NFC Error", "Init failed");
+  } else {
+    Serial.println("NFC initialized successfully");
   }
 
   if (!crypto.begin(MACHINE_UUID, PRIVATE_KEY)) {
     Serial.println("Crypto init failed");
     showStatus("Crypto Error", "Init failed");
+  } else {
+    Serial.println("Crypto initialized successfully");
   }
 
   accumulator = new MeasurementAccumulator(nfc, crypto, 9);
@@ -435,6 +440,14 @@ void handleWaitingForNfcState() {
   static unsigned long lastPoll = 0;
   if (millis() - lastPoll < 250) return;
   lastPoll = millis();
+
+  // Debug: show polling status
+  static int pollCount = 0;
+  pollCount++;
+  if (pollCount % 20 == 0) {  // Every 5 seconds (20 polls * 250ms)
+    unsigned long elapsed = (millis() - stateStartTime) / 1000;
+    Serial.printf("Waiting for NFC tag... (%lu seconds elapsed)\n", elapsed);
+  }
 
   if (nfc.waitForTag(100)) {
     Serial.println("Tag detected");
