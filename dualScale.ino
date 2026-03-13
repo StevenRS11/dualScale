@@ -129,7 +129,7 @@ void loadCalibration();
 void tare();
 void calibrate();
 void perform_test();
-void waitForButtonPress();
+bool waitForButtonPress();
 void handleIdleState();
 void handleMeasuringState();
 void handleDisplayResultsState();
@@ -738,16 +738,27 @@ void perform_test() {
   // TODO: implement test routine
 }
 
-void waitForButtonPress() {
+// Returns true for short press, false if long-hold abort detected
+bool waitForButtonPress() {
   // Wait for button to be pressed
   while (digitalRead(BUTTON) == HIGH) {
     delay(10);
   }
-  // Wait for button to be released
+  // Button is now pressed - track hold duration
+  unsigned long pressStart = millis();
   while (digitalRead(BUTTON) == LOW) {
+    if (millis() - pressStart >= BUTTON_HOLD_TIME) {
+      // Long hold detected - abort
+      // Wait for release before returning
+      while (digitalRead(BUTTON) == LOW) {
+        delay(10);
+      }
+      return false;
+    }
     delay(10);
   }
   delay(50);  // Debounce
+  return true;
 }
 
 float calculate_BP() {
@@ -771,13 +782,23 @@ void calibrate() {
 
   for (int i = 1; i < 4; ++i) {
     showStatus(String("Place ") + (int)weights[i] + "g on scale 1", "then press button");
-    waitForButtonPress();
+    if (!waitForButtonPress()) {
+      Serial.println("Calibration aborted by user");
+      showStatus("Calibration", "aborted");
+      delay(1000);
+      return;
+    }
     readings1[i] = readStable(scale1);
   }
 
   for (int i = 1; i < 4; ++i) {
     showStatus(String("Place ") + (int)weights[i] + "g on scale 2", "then press button");
-    waitForButtonPress();
+    if (!waitForButtonPress()) {
+      Serial.println("Calibration aborted by user");
+      showStatus("Calibration", "aborted");
+      delay(1000);
+      return;
+    }
     readings2[i] = readStable(scale2);
   }
 
