@@ -76,7 +76,47 @@ float calFactor1 = 1.0f;
 float calFactor2 = 1.0f;
 
 // Display update timing
-const unsigned long updateInterval = 2000;   // display + reading cadence
+const unsigned long updateInterval = 500;    // display refresh cadence
+
+// Rolling accumulator for continuous sampling
+const int RING_SIZE = 100;                   // enough for ~2s at HX711 rate
+const unsigned long RING_WINDOW_MS = 2000;   // average over last 2 seconds
+struct ScaleRing {
+  long    vals[RING_SIZE];
+  unsigned long ts[RING_SIZE];
+  int     head = 0;
+  int     count = 0;
+
+  void push(long v, unsigned long t) {
+    vals[head] = v;
+    ts[head] = t;
+    head = (head + 1) % RING_SIZE;
+    if (count < RING_SIZE) count++;
+  }
+
+  // Average all samples within the last windowMs, trimming min/max
+  bool average(unsigned long now, unsigned long windowMs, long &out) {
+    long minVal = LONG_MAX, maxVal = LONG_MIN;
+    long sum = 0;
+    int  n = 0;
+    for (int i = 0; i < count; i++) {
+      int idx = (head - 1 - i + RING_SIZE) % RING_SIZE;
+      if (now - ts[idx] > windowMs) break;  // older than window
+      long v = vals[idx];
+      if (v < minVal) minVal = v;
+      if (v > maxVal) maxVal = v;
+      sum += v;
+      n++;
+    }
+    if (n < 3) { out = 0; return false; }   // not enough samples yet
+    // Trim min and max for outlier rejection
+    sum -= minVal + maxVal;
+    out = sum / (n - 2);
+    return true;
+  }
+};
+
+ScaleRing ring1, ring2;
 unsigned long lastUpdate = 0;
 
 float lastVal1 = 0.0f;
@@ -334,6 +374,17 @@ void loop() {
       break;
   }
 
+  // Continuous sampling — grab one reading per scale each loop iteration
+  if (currentState == IDLE) {
+    unsigned long now = millis();
+    if (scale1.is_ready()) {
+      ring1.push(scale1.read(), now);
+    }
+    if (scale2.is_ready()) {
+      ring2.push(scale2.read(), now);
+    }
+  }
+
   // State machine handler
   switch (currentState) {
     case IDLE:
@@ -364,8 +415,8 @@ void loop() {
 }
 
 void handleIdleState() {
-  // Existing live display behavior
   if (millis() - lastUpdate >= updateInterval) {
+    lastUpdate = millis();
     updateReadings();
   }
 }
@@ -635,16 +686,19 @@ long readStable(HX711 &scale) {
 }
 
 void updateReadings() {
-  long raw1 = readStable(scale1);
-  long raw2 = readStable(scale2);
+  unsigned long now = millis();
+  long raw1 = 0, raw2 = 0;
+  bool ok1 = ring1.average(now, RING_WINDOW_MS, raw1);
+  bool ok2 = ring2.average(now, RING_WINDOW_MS, raw2);
+
   #if DISPLAY_TYPE_OLED
-  if (raw1 == 0 && raw2 == 0) {
+  if (!ok1 && !ok2) {
     showStatus("Load cells", "not ready");
     return;
-  } else if (raw1 == 0) {
+  } else if (!ok1) {
     showStatus("Scale 1 (head)", "not ready");
     return;
-  } else if (raw2 == 0) {
+  } else if (!ok2) {
     showStatus("Scale 2 (handle)", "not ready");
     return;
   }
@@ -677,14 +731,19 @@ void updateReadings() {
   }
 
   // Precompute strings (fixed positions):
-  String l0 = String("Static Weight: ") + String((val1 + val2) / 28.35, 2);
-  String l1 = String("BP: ") + String(calculate_BP());
-  String l2 = String("ESW: ") + String(estimate_MOI());
-  String l3 = String("Handle Mass: ") + String(val2, 2);
-  String l4 = String("Head Mass: ") + String(val1, 2);
+  float staticWeightOz = (val1 + val2) / 28.35;
+  String l0 = String("Weight: ") + String(staticWeightOz, 2) + " oz";
+  String l1, l2;
+  if (staticWeightOz > 5.0f) {
+    l1 = String("BP: ") + String(calculate_BP());
+    l2 = String("ESW: ") + String(estimate_MOI());
+  } else {
+    l1 = "";
+    l2 = "";
+  }
 
   // Static cache of last-drawn text to decide what to repaint
-  static String p0, p1, p2, p3, p4;
+  static String p0, p1, p2;
 
   auto drawLineIfChanged = [&](int y, const String& now, String& prev) {
   #if DISPLAY_TYPE_OLED
@@ -695,7 +754,7 @@ void updateReadings() {
     display.setTextColor(WHITE);
     display.print(now);
   #else
-    // For TFT, just reprint (cheap enough at 2s cadence)
+    // For TFT, just reprint (cheap enough)
     tft.fillRect(0, y, 240, 20, TFT_BLACK);
     tft.setCursor(4, y);
     tft.print(now);
@@ -706,8 +765,6 @@ void updateReadings() {
   drawLineIfChanged(0,  l0, p0);
   drawLineIfChanged(16, l1, p1);
   drawLineIfChanged(32, l2, p2);
-  drawLineIfChanged(48, l3, p3);
-  drawLineIfChanged(56, l4, p4);
 
   // Push the buffer ONCE (OLED)
   #if DISPLAY_TYPE_OLED
@@ -716,7 +773,6 @@ void updateReadings() {
 
   lastVal1 = val1;
   lastVal2 = val2;
-  lastUpdate = millis();
 }
 
 void tare() {
