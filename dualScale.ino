@@ -145,6 +145,12 @@ float calculatedBalancePoint = 0.0f;
 float calculatedSwingWeight = 0.0f;
 float calculatedMass = 0.0f;
 
+// Last completed measurement (for comparative display)
+bool hasLastMeasurement = false;
+float lastMeasMass = 0.0f;
+float lastMeasBP = 0.0f;
+float lastMeasESW = 0.0f;
+
 // NFC retry tracking
 int nfcRetryCount = 0;
 const int MAX_NFC_RETRIES = 5;
@@ -227,12 +233,15 @@ namespace Display {
  }
 }
 
+bool statusShown = false;  // track when showStatus has drawn to the screen
+
 void showStatus(const String &line1, const String &line2 = String()) {
   Display::clear();
   Display::printLine(0, line1);
   if (line2.length()) {
     Display::printLine(16, line2);
   }
+  statusShown = true;
 }
 
 void setup() {
@@ -303,8 +312,8 @@ void setup() {
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
 
-  tare();
   loadCalibration();
+  tare();
 
   // If we made it here, clear boot count (successful boot)
   if (prefs.begin("dualScale", false)) {
@@ -466,6 +475,12 @@ void handleMeasuringState() {
 
     Serial.printf("Measurements: Head=%.2fg Handle=%.2fg\n",
                   measuredHeadWeight, measuredHandleWeight);
+
+    // Save as last measurement for comparative display
+    hasLastMeasurement = true;
+    lastMeasMass = calculatedMass;
+    lastMeasBP = calculatedBalancePoint;
+    lastMeasESW = calculatedSwingWeight;
 
     currentState = DISPLAY_RESULTS;
     stateStartTime = millis();
@@ -730,31 +745,43 @@ void updateReadings() {
     return;
   }
 
-  // Precompute strings (fixed positions):
-  float staticWeightOz = (val1 + val2) / 28.35;
-  String l0 = String("Weight: ") + String(staticWeightOz, 2) + " oz";
-  String l1, l2;
-  if (staticWeightOz > 5.0f) {
-    l1 = String("BP: ") + String(calculate_BP());
-    l2 = String("ESW: ") + String(estimate_MOI());
-  } else {
-    l1 = "";
-    l2 = "";
+  // If showStatus was used, do a full clear and invalidate cache
+  // so no stale pixels remain from status text at different y positions
+  static String p0, p1, p2, p3;
+  if (statusShown) {
+    Display::clear();
+    #if DISPLAY_TYPE_OLED
+      display.display();
+    #endif
+    p0 = p1 = p2 = p3 = "";
+    statusShown = false;
   }
 
-  // Static cache of last-drawn text to decide what to repaint
-  static String p0, p1, p2;
+  // Precompute strings for live readings
+  float staticWeightOz = (val1 + val2) / 28.35;
+  String l0 = String("Weight: ") + String(staticWeightOz, 2) + " oz";
+  String l1;
+  if (staticWeightOz > 5.0f) {
+    l1 = String("BP:") + String(calculate_BP(), 1) + " ESW:" + String(estimate_MOI(), 1);
+  } else {
+    l1 = "";
+  }
+
+  // Last measurement lines
+  String l2, l3;
+  if (hasLastMeasurement) {
+    l2 = String("[last] ") + String(lastMeasMass, 2) + " oz";
+    l3 = String("BP:") + String(lastMeasBP, 1) + " ESW:" + String(lastMeasESW, 1);
+  }
 
   auto drawLineIfChanged = [&](int y, const String& now, String& prev) {
   #if DISPLAY_TYPE_OLED
     if (now == prev) return;            // no repaint needed
-    // Erase only this row area (full width)
     display.fillRect(0, y, 128, 10, BLACK);
     display.setCursor(0, y);
     display.setTextColor(WHITE);
     display.print(now);
   #else
-    // For TFT, just reprint (cheap enough)
     tft.fillRect(0, y, 240, 20, TFT_BLACK);
     tft.setCursor(4, y);
     tft.print(now);
@@ -762,9 +789,12 @@ void updateReadings() {
     prev = now;
   };
 
+  // Live readings: y=0, y=12
+  // Last measurement: y=28, y=40
   drawLineIfChanged(0,  l0, p0);
-  drawLineIfChanged(16, l1, p1);
-  drawLineIfChanged(32, l2, p2);
+  drawLineIfChanged(12, l1, p1);
+  drawLineIfChanged(28, l2, p2);
+  drawLineIfChanged(40, l3, p3);
 
   // Push the buffer ONCE (OLED)
   #if DISPLAY_TYPE_OLED
