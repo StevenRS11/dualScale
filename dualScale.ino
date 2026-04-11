@@ -75,6 +75,68 @@ const uint8_t PRIVATE_KEY[32] = {
 float calFactor1 = 1.0f;
 float calFactor2 = 1.0f;
 
+// Calibration data structure for redundant NVS storage
+struct CalData {
+  float cal1;
+  float cal2;
+  long  tare1;
+  long  tare2;
+  uint32_t crc;
+};
+
+// CRC32 (same polynomial as PNG/ZIP)
+static uint32_t calCrc32(const void* data, size_t len) {
+  const uint8_t* p = (const uint8_t*)data;
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= p[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+  }
+  return ~crc;
+}
+
+static bool writeCalToNamespace(const char* ns, const CalData& d) {
+  Preferences p;
+  if (!p.begin(ns, false)) {
+    Serial.printf("[NVS] begin(%s, rw) failed\n", ns);
+    return false;
+  }
+  p.putFloat("cal1", d.cal1);
+  p.putFloat("cal2", d.cal2);
+  p.putLong("tare1", d.tare1);
+  p.putLong("tare2", d.tare2);
+  p.putULong("crc", d.crc);
+  p.end();
+  return true;
+}
+
+static bool readCalFromNamespace(const char* ns, CalData& d) {
+  Preferences p;
+  if (!p.begin(ns, true)) {
+    Serial.printf("[NVS] begin(%s, ro) failed\n", ns);
+    return false;
+  }
+  d.cal1  = p.getFloat("cal1", NAN);
+  d.cal2  = p.getFloat("cal2", NAN);
+  d.tare1 = p.getLong("tare1", LONG_MIN);
+  d.tare2 = p.getLong("tare2", LONG_MIN);
+  d.crc   = p.getULong("crc", 0);
+  p.end();
+  return true;
+}
+
+static bool calDataValid(const CalData& d) {
+  // Check CRC over everything except the crc field itself
+  uint32_t expected = calCrc32(&d, offsetof(CalData, crc));
+  if (d.crc != expected) return false;
+  // Range/NaN checks
+  if (isnan(d.cal1) || isinf(d.cal1) || d.cal1 < 0.1f || d.cal1 > 1000000.0f) return false;
+  if (isnan(d.cal2) || isinf(d.cal2) || d.cal2 < 0.1f || d.cal2 > 1000000.0f) return false;
+  if (d.tare1 == LONG_MIN || d.tare2 == LONG_MIN) return false;
+  return true;
+}
+
 // Display update timing
 const unsigned long updateInterval = 500;    // display refresh cadence
 
@@ -259,6 +321,7 @@ void setup() {
   }
 
   // Check for repeated boot loops (crash detection)
+  bool skipCalibration = false;
   if (!prefs.begin("dualScale", false)) {
     Serial.println("[NVS] begin() failed in setup");
   } else {
@@ -267,14 +330,12 @@ void setup() {
     prefs.putUInt("bootCount", bootCount);
     Serial.printf("Boot count: %u\n", bootCount);
 
-    // If we've rebooted 3+ times rapidly, clear calibration
+    // If we've rebooted 3+ times rapidly, skip loading calibration this boot
+    // but do NOT delete it — the data may still be valid once the root cause is fixed
     if (bootCount >= 3) {
-      Serial.println("Multiple rapid boots detected - clearing calibration!");
-      prefs.remove("cal1");
-      prefs.remove("cal2");
-      prefs.remove("tare1");
-      prefs.remove("tare2");
+      Serial.println("Multiple rapid boots detected - skipping calibration this boot");
       prefs.putUInt("bootCount", 0);
+      skipCalibration = true;
     }
     prefs.end();
   }
@@ -312,7 +373,11 @@ void setup() {
   scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
   scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
 
-  loadCalibration();
+  if (skipCalibration) {
+    Serial.println("[NVS] Skipping calibration load due to boot loop detection");
+  } else {
+    loadCalibration();
+  }
   tare();
 
   // If we made it here, clear boot count (successful boot)
@@ -643,8 +708,7 @@ void handleWriteSuccessState() {
   static unsigned long lastStateEntry = 0;
 
   if (stateStartTime != lastStateEntry) {
-    Display::clear();
-    Display::printLine(24, "Success!");
+    showStatus("Success!");
     #if DISPLAY_TYPE_OLED
       display.display();
     #endif
@@ -952,60 +1016,54 @@ void calibrate() {
 }
 
 void saveCalibration() {
-  if (!prefs.begin("dualScale", false)) {
-    Serial.println("[NVS] begin(rw) failed");
-    return;
-  }
-  size_t w1 = prefs.putFloat("cal1", calFactor1);
-  size_t w2 = prefs.putFloat("cal2", calFactor2);
-  size_t w3 = prefs.putLong("tare1", scale1.get_offset());
-  size_t w4 = prefs.putLong("tare2", scale2.get_offset());
+  CalData d;
+  d.cal1  = calFactor1;
+  d.cal2  = calFactor2;
+  d.tare1 = scale1.get_offset();
+  d.tare2 = scale2.get_offset();
+  d.crc   = calCrc32(&d, offsetof(CalData, crc));
 
-  float  rc1 = prefs.getFloat("cal1", NAN);
-  float  rc2 = prefs.getFloat("cal2", NAN);
-  long   ro1 = prefs.getLong("tare1", LONG_MIN);
-  long   ro2 = prefs.getLong("tare2", LONG_MIN);
+  bool ok1 = writeCalToNamespace("dualScale", d);
+  bool ok2 = writeCalToNamespace("dualScaleBak", d);
 
-  prefs.end();
-
-  Serial.printf("[NVS] saved bytes: cal1=%u cal2=%u tare1=%u tare2=%u\n",
-                (unsigned)w1,(unsigned)w2,(unsigned)w3,(unsigned)w4);
-  Serial.printf("[NVS] saved values: cal1=%.6f cal2=%.6f tare1=%ld tare2=%ld\n",
-                rc1, rc2, ro1, ro2);
+  Serial.printf("[NVS] save: cal1=%.6f cal2=%.6f tare1=%ld tare2=%ld crc=0x%08X primary=%s backup=%s\n",
+                d.cal1, d.cal2, d.tare1, d.tare2, d.crc,
+                ok1 ? "OK" : "FAIL", ok2 ? "OK" : "FAIL");
 }
 
 void loadCalibration() {
-  if (!prefs.begin("dualScale", true)) {
-    Serial.println("[NVS] begin(ro) failed");
-    return;
+  CalData primary, backup;
+  bool primaryOk = readCalFromNamespace("dualScale", primary) && calDataValid(primary);
+  bool backupOk  = readCalFromNamespace("dualScaleBak", backup) && calDataValid(backup);
+
+  const char* source = nullptr;
+  CalData* chosen = nullptr;
+
+  if (primaryOk) {
+    chosen = &primary;
+    source = "primary";
+  } else if (backupOk) {
+    chosen = &backup;
+    source = "backup";
+    // Repair primary from backup
+    writeCalToNamespace("dualScale", backup);
+    Serial.println("[NVS] Primary corrupt - restored from backup");
   }
 
-  calFactor1 = prefs.getFloat("cal1", 1.0f);
-  calFactor2 = prefs.getFloat("cal2", 1.0f);
-  long offset1 = prefs.getLong("tare1", 0);
-  long offset2 = prefs.getLong("tare2", 0);
-
-  prefs.end();
-
-  // Validate loaded calibration factors
-  if (isnan(calFactor1) || isinf(calFactor1) || calFactor1 < 0.1f || calFactor1 > 1000000.0f) {
-    Serial.printf("[NVS] Invalid cal1=%.6f, resetting to 1.0\n", calFactor1);
+  if (chosen) {
+    calFactor1 = chosen->cal1;
+    calFactor2 = chosen->cal2;
+    scale1.set_scale(calFactor1);
+    scale2.set_scale(calFactor2);
+    scale1.set_offset(chosen->tare1);
+    scale2.set_offset(chosen->tare2);
+    Serial.printf("[NVS] loaded from %s: cal1=%.6f cal2=%.6f tare1=%ld tare2=%ld crc=0x%08X\n",
+                  source, chosen->cal1, chosen->cal2, chosen->tare1, chosen->tare2, chosen->crc);
+  } else {
+    Serial.println("[NVS] No valid calibration found in primary or backup - running uncalibrated");
     calFactor1 = 1.0f;
-    offset1 = 0;
-  }
-  if (isnan(calFactor2) || isinf(calFactor2) || calFactor2 < 0.1f || calFactor2 > 1000000.0f) {
-    Serial.printf("[NVS] Invalid cal2=%.6f, resetting to 1.0\n", calFactor2);
     calFactor2 = 1.0f;
-    offset2 = 0;
   }
-
-  scale1.set_scale(calFactor1);
-  scale2.set_scale(calFactor2);
-  scale1.set_offset(offset1);
-  scale2.set_offset(offset2);
-
-  Serial.printf("[NVS] loaded values: cal1=%.6f cal2=%.6f tare1=%ld tare2=%ld\n",
-                calFactor1, calFactor2, offset1, offset2);
 }
 
 
