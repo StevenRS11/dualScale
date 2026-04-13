@@ -826,8 +826,22 @@ void perform_test() {
 
 // Returns true for short press, false if long-hold abort detected
 bool waitForButtonPress() {
-  // Wait for button to be pressed
+  // Wait for button to be pressed, showing live scale readings
+  unsigned long lastReadingUpdate = 0;
   while (digitalRead(BUTTON) == HIGH) {
+    // Update live scale readings every 500ms
+    if (millis() - lastReadingUpdate >= 500) {
+      lastReadingUpdate = millis();
+      long raw1 = 0, raw2 = 0;
+      if (scale1.wait_ready_timeout(200)) raw1 = scale1.read();
+      if (scale2.wait_ready_timeout(200)) raw2 = scale2.read();
+      // Display on lower lines (prompt text is on lines 0 and 16)
+      Display::printLine(36, String("S1: ") + String(raw1));
+      Display::printLine(48, String("S2: ") + String(raw2));
+      #if DISPLAY_TYPE_OLED
+        display.display();
+      #endif
+    }
     delay(10);
   }
   // Button is now pressed - track hold duration
@@ -875,6 +889,8 @@ void calibrate() {
       return;
     }
     readings1[i] = readStable(scale1);
+    showStatus(String("S1 read: ") + String(readings1[i]), String((int)weights[i]) + "g captured");
+    delay(800);
   }
 
   for (int i = 1; i < 4; ++i) {
@@ -886,6 +902,8 @@ void calibrate() {
       return;
     }
     readings2[i] = readStable(scale2);
+    showStatus(String("S2 read: ") + String(readings2[i]), String((int)weights[i]) + "g captured");
+    delay(800);
   }
 
   // Calculate calibration factor for scale 1
