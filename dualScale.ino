@@ -1,34 +1,42 @@
 /*
-  ESP32 Dual Scale – Load Cell Display Test (Auto NFC Write)
-  Reads two HX711 load cells and displays both values every 2 seconds.
-  NFC tags are checked automatically every 2 seconds; if a tag is PRESENT,
-  the device writes once (on presence edge) and does not read from NFC at all.
+  ESP32-S3 Dual Scale – NAU7802 dual-channel load cell amp + Auto NFC Write
+  Reads a single NAU7802 dual-channel ADC (head = CH2 / load cell B,
+  handle = CH1) and displays Balance Point / Equivalent Swing Weight.
+
+  I2C topology (ESP32-S3 has only TWO hardware I2C controllers):
+    Wire  (I2C0): OLED display only            -> SDA=8,  SCL=7
+    Wire1 (I2C1): TIME-SHARED on demand:
+                  - NAU7802 load cell amp      -> SDA=3,  SCL=4  (DRDY=6)
+                  - NFC reader (MFRC522)       -> SDA=10, SCL=11
+  The scale and the NFC are used in separate phases, so Wire1 is re-pointed
+  to the active device's pins via selectBus(). See selectBus().
 */
 
 #define DISPLAY_TYPE_TFT   0
 #define DISPLAY_TYPE_OLED  1
 
-// I2C pins (from schematic)
-#define SCREEN_SDA    8   // GP6
+// OLED I2C pins (Wire, dedicated)
+#define SCREEN_SDA    8   // GP8
 #define SCREEN_SCL    7   // GP7
 
-// RFID I2C pins (separate bus)
+// NFC I2C pins (Wire1, time-shared with NAU7802)
 #define RFID_SDA      10  // GP10
 #define RFID_SCL      11  // GP11
 
+// NAU7802 I2C pins (Wire1, time-shared with NFC)
+#define NAU_SDA       3   // GP3 (SDIO)
+#define NAU_SCL       4   // GP4 (SCLK)
+#define NAU_DRDY      6   // GP6 (data-ready; optional, we poll available())
 
 #define OLED_ADDR 0x3C
-
-#define LOADCELL_DOUT2 6   // Adjust pins for your wiring
-#define LOADCELL_SCK2  5
-#define LOADCELL_DOUT1 3
-#define LOADCELL_SCK1  4
+#define NFC_ADDR  0x28   // MFRC522 on Wire1
+#define NAU_ADDR  0x2A   // NAU7802 on Wire1
 
 #define BUTTON  9
 
 
 #include <Arduino.h>
-#include <HX711.h>
+#include <SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h>
 #include <Preferences.h>
 #include <PaddleDNA.h>
 
@@ -46,13 +54,30 @@ using namespace PaddleDNA;
   #include <Adafruit_SSD1306.h>
   #define SCREEN_WIDTH 128
   #define SCREEN_HEIGHT 64
-  // Wire is used for the screen, Wire1 for RFID (both pre-defined by ESP32)
+  // Wire drives the OLED only; Wire1 is time-shared (NAU7802 / NFC)
   Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #endif
 
-HX711 scale1;
-HX711 scale2;
+NAU7802 nau;
 Preferences prefs;
+
+// NAU7802 channel assignment (CH2 = head / load cell B, CH1 = handle)
+#define CH_HEAD    NAU7802_CHANNEL_2
+#define CH_HANDLE  NAU7802_CHANNEL_1
+#define NAU_I2C_HZ 400000
+
+// Sampling depth (trimmed average; first NAU_SETTLE_SAMPLES are discarded
+// after each channel switch + AFE calibration)
+const int NAU_SETTLE_SAMPLES = 2;
+const int LIVE_SAMPLES       = 5;   // per channel, live display
+const int MEAS_SAMPLES       = 12;  // per channel, final measurement
+const int TARE_SAMPLES       = 12;  // per channel, tare
+
+// Wire1 is a single hardware controller shared between the NAU7802 and the
+// NFC reader, which live on different pins. selectBus() re-points it.
+enum BusOwner { BUS_NONE, BUS_NAU, BUS_NFC };
+BusOwner busOwner = BUS_NONE;
+void selectBus(BusOwner who);
 
 // PaddleDNA Payload library
 NFC nfc;
@@ -72,10 +97,16 @@ const uint8_t PRIVATE_KEY[32] = {
   0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB
 };
 
-float calFactor1 = 1.0f;
-float calFactor2 = 1.0f;
+// Calibration factors (counts per gram) and zero-load offsets (raw counts).
+// The NAU7802 has no persistent hardware offset register we rely on, so the
+// tare is tracked in software and subtracted at read time.
+float calFactorHead   = 1.0f;   // CH2 (load cell B)
+float calFactorHandle = 1.0f;   // CH1
+long  tareHead   = 0;           // CH2 zero-load raw
+long  tareHandle = 0;           // CH1 zero-load raw
 
-// Calibration data structure for redundant NVS storage
+// Calibration data structure for redundant NVS storage.
+// Field "1" = handle (CH1), field "2" = head (CH2).
 struct CalData {
   float cal1;
   float cal2;
@@ -140,49 +171,10 @@ static bool calDataValid(const CalData& d) {
 // Display update timing
 const unsigned long updateInterval = 500;    // display refresh cadence
 
-// Rolling accumulator for continuous sampling
-const int RING_SIZE = 100;                   // enough for ~2s at HX711 rate
-const unsigned long RING_WINDOW_MS = 2000;   // average over last 2 seconds
-struct ScaleRing {
-  long    vals[RING_SIZE];
-  unsigned long ts[RING_SIZE];
-  int     head = 0;
-  int     count = 0;
-
-  void push(long v, unsigned long t) {
-    vals[head] = v;
-    ts[head] = t;
-    head = (head + 1) % RING_SIZE;
-    if (count < RING_SIZE) count++;
-  }
-
-  // Average all samples within the last windowMs, trimming min/max
-  bool average(unsigned long now, unsigned long windowMs, long &out) {
-    long minVal = LONG_MAX, maxVal = LONG_MIN;
-    long sum = 0;
-    int  n = 0;
-    for (int i = 0; i < count; i++) {
-      int idx = (head - 1 - i + RING_SIZE) % RING_SIZE;
-      if (now - ts[idx] > windowMs) break;  // older than window
-      long v = vals[idx];
-      if (v < minVal) minVal = v;
-      if (v > maxVal) maxVal = v;
-      sum += v;
-      n++;
-    }
-    if (n < 3) { out = 0; return false; }   // not enough samples yet
-    // Trim min and max for outlier rejection
-    sum -= minVal + maxVal;
-    out = sum / (n - 2);
-    return true;
-  }
-};
-
-ScaleRing ring1, ring2;
 unsigned long lastUpdate = 0;
 
-float lastVal1 = 0.0f;
-float lastVal2 = 0.0f;
+float lastVal1 = 0.0f;   // head (grams)
+float lastVal2 = 0.0f;   // handle (grams)
 
 // Measurement workflow state machine
 enum MachineState {
@@ -230,7 +222,7 @@ ButtonState buttonState = BTN_IDLE;
 unsigned long buttonPressStart = 0;
 const unsigned long BUTTON_HOLD_TIME = 3000;
  
-long readStable(HX711 &scale);
+bool nauReadChannel(uint8_t channel, int nSamples, long &out);
 void updateReadings();
 void saveCalibration();
 void loadCalibration();
@@ -306,9 +298,95 @@ void showStatus(const String &line1, const String &line2 = String()) {
   statusShown = true;
 }
 
+// ---- I2C module connectivity reporting ----
+
+// Returns true if a device ACKs at the given address on the given bus.
+static bool i2cProbe(TwoWire &bus, uint8_t addr) {
+  bus.beginTransmission(addr);
+  return bus.endTransmission() == 0;
+}
+
+// Print one fixed-width row of the I2C module report.
+static void reportI2CModule(const char *name, const char *busName,
+                            const char *pins, uint8_t addr, bool present) {
+  Serial.printf("  %-13s %-5s %-7s 0x%02X  %s\n",
+                name, busName, pins, addr,
+                present ? "CONNECTED" : "-- MISSING --");
+}
+
+// Re-point the time-shared Wire1 controller between the NAU7802 and the NFC
+// reader (they sit on different pins of the same hardware I2C peripheral).
+void selectBus(BusOwner who) {
+  if (busOwner == who) return;
+  Wire1.end();
+  delay(2);
+  if (who == BUS_NAU) {
+    Wire1.begin(NAU_SDA, NAU_SCL);
+    Wire1.setClock(NAU_I2C_HZ);
+    // NAU7802 retains its configuration across the bus idling, so no re-begin.
+  } else {  // BUS_NFC
+    Wire1.begin(RFID_SDA, RFID_SCL);
+    Wire1.setClock(400000);
+    nfc.begin(Wire1);   // re-init the reader now that the bus points at it
+  }
+  busOwner = who;
+  delay(2);
+}
+
+// Probe every known module (across the time-shared Wire1) and print a
+// structured connectivity report. Leaves Wire1 pointed at the NAU7802.
+static bool g_oledPresent = false;
+static bool g_nfcPresent  = false;
+static bool g_nauPresent  = false;
+
+static void scanI2CModules() {
+  // OLED lives alone on its own controller (Wire)
+  Wire.begin(SCREEN_SDA, SCREEN_SCL);
+  Wire.setClock(400000);
+
+  // Wire1 is time-shared: probe the NAU pins first...
+  Wire1.begin(NAU_SDA, NAU_SCL);
+  Wire1.setClock(NAU_I2C_HZ);
+  delay(50);
+  g_oledPresent = i2cProbe(Wire, OLED_ADDR);
+  g_nauPresent  = i2cProbe(Wire1, NAU_ADDR);
+
+  // ...then re-point Wire1 to the NFC pins and probe there
+  Wire1.end();
+  Wire1.begin(RFID_SDA, RFID_SCL);
+  Wire1.setClock(400000);
+  delay(20);
+  g_nfcPresent = i2cProbe(Wire1, NFC_ADDR);
+
+  // Leave Wire1 on the NAU for normal (idle) operation
+  Wire1.end();
+  Wire1.begin(NAU_SDA, NAU_SCL);
+  Wire1.setClock(NAU_I2C_HZ);
+  busOwner = BUS_NAU;
+
+  Serial.println();
+  Serial.println("================ I2C Module Report ================");
+  Serial.println("  Module        Bus   Pins     Addr  Status");
+  Serial.println("  ------------------------------------------------");
+  reportI2CModule("OLED Display", "Wire",  "SDA8/7",   OLED_ADDR, g_oledPresent);
+  reportI2CModule("NAU7802 amp",  "Wire1", "SDA3/4",   NAU_ADDR,  g_nauPresent);
+  reportI2CModule("NFC MFRC522",  "Wire1", "SDA10/11", NFC_ADDR,  g_nfcPresent);
+  Serial.println("  (NAU7802 + NFC time-share the Wire1 controller)");
+  Serial.println("===================================================");
+  Serial.println();
+  Serial.flush();  // push the report out before the heavier init work
+}
+
 void setup() {
   Serial.begin(115200);
-  delay(100); // Let serial stabilize
+  // ESP32-S3 uses native USB CDC: anything printed before the host enumerates
+  // the port is silently dropped. Wait (briefly) for the connection so the
+  // boot-time I2C report and module init logs aren't lost.
+  unsigned long serialWaitStart = millis();
+  while (!Serial && (millis() - serialWaitStart) < 2000) {
+    delay(10);
+  }
+  delay(300);  // extra margin for the CDC host to attach
   Serial.println("Init start");
 
   // Configure button pin with internal pull-up
@@ -340,17 +418,32 @@ void setup() {
     prefs.end();
   }
 
+  // Probe all I2C modules (across the time-shared Wire1) and print a report.
+  // Leaves Wire1 pointed at the NAU7802 (busOwner == BUS_NAU).
+  scanI2CModules();
+
   Serial.println("Display Init start");
   Display::begin();
   Serial.println("Display Init finish");
 
-  // Initialize Payload library
-  Serial.println("Payload Init Start");
-  Wire1.begin(RFID_SDA, RFID_SCL);
-  Wire1.setClock(400000);
-  delay(100);  // Critical: stabilize I2C before NFC init
+  // NAU7802 load cell amp (Wire1 currently on NAU pins from scanI2CModules)
+  Serial.println("NAU7802 Init Start");
+  if (!nau.begin(Wire1)) {
+    Serial.println("NAU7802 init failed - load cell amp not detected");
+    showStatus("Load cell err", "NAU7802 missing");
+  } else {
+    nau.setLDO(NAU7802_LDO_3V3);
+    nau.setGain(NAU7802_GAIN_128);
+    nau.setSampleRate(NAU7802_SPS_40);   // medium rate, good noise rejection
+    nau.calibrateAFE();                  // internal offset cal
+    Serial.println("NAU7802 initialized successfully");
+  }
 
-  nfc.setDebug(true);  // Enable NFC debug output
+  // Initialize Payload library (re-point Wire1 to the NFC pins)
+  Serial.println("Payload Init Start");
+  selectBus(BUS_NFC);          // Wire1 -> RFID pins + nfc.begin()
+  delay(100);                  // stabilize I2C before talking to the reader
+  nfc.setDebug(true);
   if (!nfc.begin(Wire1)) {
     Serial.println("NFC init failed");
     showStatus("NFC Error", "Init failed");
@@ -368,10 +461,8 @@ void setup() {
   accumulator = new MeasurementAccumulator(nfc, crypto, 9);
   Serial.println("Payload Init Finish");
 
-  // Load cells
-  Serial.println("Load cells init");
-  scale1.begin(LOADCELL_DOUT1, LOADCELL_SCK1);
-  scale2.begin(LOADCELL_DOUT2, LOADCELL_SCK2);
+  // Return the shared bus to the NAU7802 for live operation
+  selectBus(BUS_NAU);
 
   if (skipCalibration) {
     Serial.println("[NVS] Skipping calibration load due to boot loop detection");
@@ -431,7 +522,9 @@ void loop() {
         } else {
           // In any other state (NFC workflow): ABORT
           Serial.println("Long press - aborting operation");
-          nfc.halt();  // Release tag if one is selected
+          selectBus(BUS_NFC);  // ensure the reader is addressable before halt
+          nfc.halt();          // Release tag if one is selected
+          selectBus(BUS_NAU);  // hand the shared bus back to the load cell amp
           showStatus("Cancelled");
           delay(1000);
           currentState = IDLE;
@@ -446,17 +539,6 @@ void loop() {
         buttonState = BTN_IDLE;
       }
       break;
-  }
-
-  // Continuous sampling — grab one reading per scale each loop iteration
-  if (currentState == IDLE) {
-    unsigned long now = millis();
-    if (scale1.is_ready()) {
-      ring1.push(scale1.read(), now);
-    }
-    if (scale2.is_ready()) {
-      ring2.push(scale2.read(), now);
-    }
   }
 
   // State machine handler
@@ -516,10 +598,11 @@ void handleMeasuringState() {
 
   // After 4 seconds, take final measurement
   if (elapsed >= STABILIZATION_TIME) {
-    long raw1 = readStable(scale1);
-    long raw2 = readStable(scale2);
+    long rawHead = 0, rawHandle = 0;
+    bool okHead   = nauReadChannel(CH_HEAD,   MEAS_SAMPLES, rawHead);
+    bool okHandle = nauReadChannel(CH_HANDLE, MEAS_SAMPLES, rawHandle);
 
-    if (raw1 == 0 || raw2 == 0) {
+    if (!okHead || !okHandle) {
       showStatus("Measurement", "failed");
       delay(2000);
       currentState = IDLE;
@@ -527,9 +610,9 @@ void handleMeasuringState() {
       return;
     }
 
-    // Capture measurements
-    measuredHeadWeight = (raw1 - scale1.get_offset()) / calFactor1;
-    measuredHandleWeight = (raw2 - scale2.get_offset()) / calFactor2;
+    // Capture measurements (subtract software tare, divide by counts/gram)
+    measuredHeadWeight   = (rawHead   - tareHead)   / calFactorHead;
+    measuredHandleWeight = (rawHandle - tareHandle) / calFactorHandle;
 
     // Calculate display values
     lastVal1 = measuredHeadWeight;
@@ -577,6 +660,9 @@ void handleDisplayResultsState() {
 }
 
 void handleWaitingForNfcState() {
+  // Hand the shared Wire1 controller to the NFC reader (no-op if already there)
+  selectBus(BUS_NFC);
+
   // Check for timeout
   if (millis() - stateStartTime >= NFC_TIMEOUT) {
     Serial.println("NFC timeout");
@@ -600,6 +686,8 @@ void handleWaitingForNfcState() {
 void handleWritingNfcState() {
   // Only execute write logic once when first entering this state
   static unsigned long lastStateEntry = 0;
+
+  selectBus(BUS_NFC);  // ensure the reader owns the shared bus before writing
 
   if (stateStartTime != lastStateEntry) {
     // State just entered - update display and perform write
@@ -669,6 +757,8 @@ void handleRetryPromptState() {
   // Only update display once when first entering this state
   static unsigned long lastStateEntry = 0;
   static bool tagWasRemoved = false;
+
+  selectBus(BUS_NFC);  // tag polling happens here; keep the reader on the bus
 
   if (stateStartTime != lastStateEntry) {
     // State just changed - redraw display
@@ -740,72 +830,102 @@ void handleWriteFailedState() {
   }
 }
 
-long readStable(HX711 &scale) {
-  // Wait for the HX711 to become ready; bail out if it never does
-  if (!scale.wait_ready_timeout(1000)) {
-    Serial.println("HX711 not ready");
-    return 0;
-  }
-
-  long samples[10];
-  for (int i = 0; i < 10; ++i) {
-    samples[i] = scale.read();
+// Wait (with timeout) for the next NAU7802 conversion and return it.
+// Returns false if no sample arrives within timeoutMs.
+static bool nauNextSample(long &out, unsigned long timeoutMs) {
+  unsigned long t0 = millis();
+  while (!nau.available()) {
+    if (millis() - t0 > timeoutMs) return false;
     delay(1);  // yield to avoid watchdog reset
   }
-  long minVal = samples[0];
-  long maxVal = samples[0];
-  long sum = 0;
-  for (int i = 0; i < 10; ++i) {
-    if (samples[i] < minVal) minVal = samples[i];
-    if (samples[i] > maxVal) maxVal = samples[i];
-    sum += samples[i];
+  out = nau.getReading();
+  return true;
+}
+
+// Read one NAU7802 channel: switch to it, recalibrate the AFE (internal
+// offset cal — does not disturb the external load), discard settling
+// conversions, then return a min/max-trimmed average of nSamples.
+// Returns false on I2C/timeout failure.
+bool nauReadChannel(uint8_t channel, int nSamples, long &out) {
+  out = 0;
+  selectBus(BUS_NAU);                 // ensure the amp owns the shared bus
+  if (!nau.setChannel(channel)) {
+    Serial.println("NAU7802 setChannel failed");
+    return false;
   }
-  sum -= minVal + maxVal;
-  return sum / 8;
+  nau.calibrateAFE();                 // required after each channel switch
+
+  // Discard the first few conversions after the switch (settling)
+  long discard;
+  for (int i = 0; i < NAU_SETTLE_SAMPLES; ++i) {
+    if (!nauNextSample(discard, 500)) {
+      Serial.println("NAU7802 not ready (settle)");
+      return false;
+    }
+  }
+
+  long minVal = LONG_MAX, maxVal = LONG_MIN, sum = 0;
+  int got = 0;
+  for (int i = 0; i < nSamples; ++i) {
+    long v;
+    if (!nauNextSample(v, 500)) break;
+    if (v < minVal) minVal = v;
+    if (v > maxVal) maxVal = v;
+    sum += v;
+    got++;
+  }
+  if (got < 3) {
+    Serial.println("NAU7802 insufficient samples");
+    return false;
+  }
+  sum -= minVal + maxVal;             // trim outliers
+  out = sum / (got - 2);
+  return true;
 }
 
 void updateReadings() {
-  unsigned long now = millis();
-  long raw1 = 0, raw2 = 0;
-  bool ok1 = ring1.average(now, RING_WINDOW_MS, raw1);
-  bool ok2 = ring2.average(now, RING_WINDOW_MS, raw2);
+  // The NAU7802 multiplexes a single ADC, so we can't sample both channels at
+  // once. Read ONE channel per call, alternating, to keep the loop responsive.
+  // lastVal1 = head (CH2), lastVal2 = handle (CH1); both persist between calls.
+  static uint8_t liveToggle = 0;
+  static bool headReady = false, handleReady = false;
+
+  long raw;
+  if (liveToggle == 0) {
+    headReady = nauReadChannel(CH_HEAD, LIVE_SAMPLES, raw);
+    if (headReady) lastVal1 = (raw - tareHead) / calFactorHead;
+  } else {
+    handleReady = nauReadChannel(CH_HANDLE, LIVE_SAMPLES, raw);
+    if (handleReady) lastVal2 = (raw - tareHandle) / calFactorHandle;
+  }
+  liveToggle ^= 1;
 
   #if DISPLAY_TYPE_OLED
-  if (!ok1 && !ok2) {
-    showStatus("Load cells", "not ready");
-    return;
-  } else if (!ok1) {
-    showStatus("Scale 1 (head)", "not ready");
-    return;
-  } else if (!ok2) {
-    showStatus("Scale 2 (handle)", "not ready");
+  if (!headReady && !handleReady) {
+    showStatus("Load cell", "not ready");
     return;
   }
   #endif
+
   // Validate calibration factors to prevent NaN
-  if (calFactor1 < 0.1f || calFactor1 > 1000000.0f || isnan(calFactor1) || isinf(calFactor1)) {
-    showStatus("Invalid cal", "Scale 1 - recal");
-    Serial.printf("Invalid calFactor1: %.2f\n", calFactor1);
+  if (calFactorHead < 0.1f || calFactorHead > 1000000.0f || isnan(calFactorHead) || isinf(calFactorHead)) {
+    showStatus("Invalid cal", "Head - recal");
+    Serial.printf("Invalid calFactorHead: %.2f\n", calFactorHead);
     return;
   }
-  if (calFactor2 < 0.1f || calFactor2 > 1000000.0f || isnan(calFactor2) || isinf(calFactor2)) {
-    showStatus("Invalid cal", "Scale 2 - recal");
-    Serial.printf("Invalid calFactor2: %.2f\n", calFactor2);
+  if (calFactorHandle < 0.1f || calFactorHandle > 1000000.0f || isnan(calFactorHandle) || isinf(calFactorHandle)) {
+    showStatus("Invalid cal", "Handle - recal");
+    Serial.printf("Invalid calFactorHandle: %.2f\n", calFactorHandle);
     return;
   }
 
-  float val1 = (raw1 - scale1.get_offset()) / calFactor1;
-  float val2 = (raw2 - scale2.get_offset()) / calFactor2;
+  float val1 = lastVal1;  // head (grams)
+  float val2 = lastVal2;  // handle (grams)
 
   // Check for invalid results
-  if (isnan(val1) || isinf(val1)) {
-    showStatus("Scale 1 error", "NaN/Inf result");
-    Serial.printf("Scale 1 invalid result: %.2f\n", val1);
-    return;
-  }
-  if (isnan(val2) || isinf(val2)) {
-    showStatus("Scale 2 error", "NaN/Inf result");
-    Serial.printf("Scale 2 invalid result: %.2f\n", val2);
+  if (isnan(val1) || isinf(val1) || isnan(val2) || isinf(val2)) {
+    showStatus("Scale error", "NaN/Inf result");
+    Serial.printf("Invalid result: head=%.2f handle=%.2f\n", val1, val2);
     return;
   }
 
@@ -871,16 +991,18 @@ void updateReadings() {
 
 void tare() {
   showStatus("Taring...");
-  if (scale1.wait_ready_timeout(1000)) {
-    scale1.tare();
+  long rawHead, rawHandle;
+  if (nauReadChannel(CH_HEAD, TARE_SAMPLES, rawHead)) {
+    tareHead = rawHead;
   } else {
-    Serial.println("scale1 tare timeout");
+    Serial.println("head (CH2) tare failed");
   }
-  if (scale2.wait_ready_timeout(1000)) {
-    scale2.tare();
+  if (nauReadChannel(CH_HANDLE, TARE_SAMPLES, rawHandle)) {
+    tareHandle = rawHandle;
   } else {
-    Serial.println("scale2 tare timeout");
+    Serial.println("handle (CH1) tare failed");
   }
+  Serial.printf("Tare: head=%ld handle=%ld\n", tareHead, tareHandle);
   showStatus("Tare done");
 }
 
@@ -896,12 +1018,12 @@ bool waitForButtonPress() {
     // Update live scale readings every 500ms
     if (millis() - lastReadingUpdate >= 500) {
       lastReadingUpdate = millis();
-      long raw1 = 0, raw2 = 0;
-      if (scale1.wait_ready_timeout(200)) raw1 = scale1.read();
-      if (scale2.wait_ready_timeout(200)) raw2 = scale2.read();
+      long rawHead = 0, rawHandle = 0;
+      nauReadChannel(CH_HEAD,   LIVE_SAMPLES, rawHead);
+      nauReadChannel(CH_HANDLE, LIVE_SAMPLES, rawHandle);
       // Display on lower lines (prompt text is on lines 0 and 16)
-      Display::printLine(36, String("S1: ") + String(raw1));
-      Display::printLine(48, String("S2: ") + String(raw2));
+      Display::printLine(36, String("Head: ") + String(rawHead));
+      Display::printLine(48, String("Hand: ") + String(rawHandle));
       #if DISPLAY_TYPE_OLED
         display.display();
       #endif
@@ -939,95 +1061,101 @@ void calibrate() {
   tare();
 
   float weights[4] = {0.0f, 100.0f, 200.0f, 300.0f};
-  long readings1[4];
-  long readings2[4];
-  readings1[0] = scale1.get_offset();
-  readings2[0] = scale2.get_offset();
+  long readingsHead[4];
+  long readingsHandle[4];
+  readingsHead[0]   = tareHead;    // zero-load reading from tare()
+  readingsHandle[0] = tareHandle;
 
+  // Head channel (CH2 / load cell B)
   for (int i = 1; i < 4; ++i) {
-    showStatus(String("Place ") + (int)weights[i] + "g on scale 1", "then press button");
+    showStatus(String("Place ") + (int)weights[i] + "g on HEAD", "then press button");
     if (!waitForButtonPress()) {
       Serial.println("Calibration aborted by user");
       showStatus("Calibration", "aborted");
       delay(1000);
       return;
     }
-    readings1[i] = readStable(scale1);
-    showStatus(String("S1 read: ") + String(readings1[i]), String((int)weights[i]) + "g captured");
+    if (!nauReadChannel(CH_HEAD, MEAS_SAMPLES, readingsHead[i])) {
+      showStatus("Cal failed!", "Head read err");
+      delay(2000);
+      return;
+    }
+    showStatus(String("Head: ") + String(readingsHead[i]), String((int)weights[i]) + "g captured");
     delay(800);
   }
 
+  // Handle channel (CH1)
   for (int i = 1; i < 4; ++i) {
-    showStatus(String("Place ") + (int)weights[i] + "g on scale 2", "then press button");
+    showStatus(String("Place ") + (int)weights[i] + "g on HANDLE", "then press button");
     if (!waitForButtonPress()) {
       Serial.println("Calibration aborted by user");
       showStatus("Calibration", "aborted");
       delay(1000);
       return;
     }
-    readings2[i] = readStable(scale2);
-    showStatus(String("S2 read: ") + String(readings2[i]), String((int)weights[i]) + "g captured");
+    if (!nauReadChannel(CH_HANDLE, MEAS_SAMPLES, readingsHandle[i])) {
+      showStatus("Cal failed!", "Handle read err");
+      delay(2000);
+      return;
+    }
+    showStatus(String("Handle: ") + String(readingsHandle[i]), String((int)weights[i]) + "g captured");
     delay(800);
   }
 
-  // Calculate calibration factor for scale 1
+  // Least-squares regression for the head channel
   float sumW = 0.0f, sumR = 0.0f;
-  for (int i = 0; i < 4; ++i) { sumW += weights[i]; sumR += readings1[i]; }
+  for (int i = 0; i < 4; ++i) { sumW += weights[i]; sumR += readingsHead[i]; }
   float meanW = sumW / 4.0f; float meanR = sumR / 4.0f;
   float num = 0.0f, den = 0.0f;
   for (int i = 0; i < 4; ++i) {
-    num += (weights[i] - meanW) * (readings1[i] - meanR);
+    num += (weights[i] - meanW) * (readingsHead[i] - meanR);
     den += (weights[i] - meanW) * (weights[i] - meanW);
   }
 
   if (den < 0.001f || isnan(den) || isnan(num)) {
-    showStatus("Cal failed!", "Scale 1 bad data");
-    Serial.printf("Scale 1 calibration failed: num=%.2f den=%.2f\n", num, den);
+    showStatus("Cal failed!", "Head bad data");
+    Serial.printf("Head calibration failed: num=%.2f den=%.2f\n", num, den);
     delay(2000);
     return;
   }
 
-  calFactor1 = num / den;
-  if (calFactor1 < 0.1f || calFactor1 > 1000000.0f || isnan(calFactor1)) {
-    showStatus("Cal failed!", "Scale 1 invalid");
-    Serial.printf("Scale 1 invalid factor: %.2f\n", calFactor1);
+  calFactorHead = num / den;
+  if (calFactorHead < 0.1f || calFactorHead > 1000000.0f || isnan(calFactorHead)) {
+    showStatus("Cal failed!", "Head invalid");
+    Serial.printf("Head invalid factor: %.2f\n", calFactorHead);
     delay(2000);
     return;
   }
 
-  long offset1 = (long)(meanR - calFactor1 * meanW);
-  scale1.set_scale(calFactor1);
-  scale1.set_offset(offset1);
-  Serial.printf("Scale 1: calFactor=%.2f offset=%ld\n", calFactor1, offset1);
+  tareHead = (long)(meanR - calFactorHead * meanW);  // regression zero-load offset
+  Serial.printf("Head: calFactor=%.2f offset=%ld\n", calFactorHead, tareHead);
 
-  // Calculate calibration factor for scale 2
+  // Least-squares regression for the handle channel
   sumW = 0.0f; sumR = 0.0f; num = 0.0f; den = 0.0f;
-  for (int i = 0; i < 4; ++i) { sumW += weights[i]; sumR += readings2[i]; }
+  for (int i = 0; i < 4; ++i) { sumW += weights[i]; sumR += readingsHandle[i]; }
   meanW = sumW / 4.0f; meanR = sumR / 4.0f;
   for (int i = 0; i < 4; ++i) {
-    num += (weights[i] - meanW) * (readings2[i] - meanR);
+    num += (weights[i] - meanW) * (readingsHandle[i] - meanR);
     den += (weights[i] - meanW) * (weights[i] - meanW);
   }
 
   if (den < 0.001f || isnan(den) || isnan(num)) {
-    showStatus("Cal failed!", "Scale 2 bad data");
-    Serial.printf("Scale 2 calibration failed: num=%.2f den=%.2f\n", num, den);
+    showStatus("Cal failed!", "Handle bad data");
+    Serial.printf("Handle calibration failed: num=%.2f den=%.2f\n", num, den);
     delay(2000);
     return;
   }
 
-  calFactor2 = num / den;
-  if (calFactor2 < 0.1f || calFactor2 > 1000000.0f || isnan(calFactor2)) {
-    showStatus("Cal failed!", "Scale 2 invalid");
-    Serial.printf("Scale 2 invalid factor: %.2f\n", calFactor2);
+  calFactorHandle = num / den;
+  if (calFactorHandle < 0.1f || calFactorHandle > 1000000.0f || isnan(calFactorHandle)) {
+    showStatus("Cal failed!", "Handle invalid");
+    Serial.printf("Handle invalid factor: %.2f\n", calFactorHandle);
     delay(2000);
     return;
   }
 
-  long offset2 = (long)(meanR - calFactor2 * meanW);
-  scale2.set_scale(calFactor2);
-  scale2.set_offset(offset2);
-  Serial.printf("Scale 2: calFactor=%.2f offset=%ld\n", calFactor2, offset2);
+  tareHandle = (long)(meanR - calFactorHandle * meanW);
+  Serial.printf("Handle: calFactor=%.2f offset=%ld\n", calFactorHandle, tareHandle);
 
   saveCalibration();
   showStatus("Calibration", "complete");
@@ -1035,10 +1163,10 @@ void calibrate() {
 
 void saveCalibration() {
   CalData d;
-  d.cal1  = calFactor1;
-  d.cal2  = calFactor2;
-  d.tare1 = scale1.get_offset();
-  d.tare2 = scale2.get_offset();
+  d.cal1  = calFactorHandle;  // field "1" = handle (CH1)
+  d.cal2  = calFactorHead;    // field "2" = head   (CH2)
+  d.tare1 = tareHandle;
+  d.tare2 = tareHead;
   d.crc   = calCrc32(&d, offsetof(CalData, crc));
 
   bool ok1 = writeCalToNamespace("dualScale", d);
@@ -1069,18 +1197,16 @@ void loadCalibration() {
   }
 
   if (chosen) {
-    calFactor1 = chosen->cal1;
-    calFactor2 = chosen->cal2;
-    scale1.set_scale(calFactor1);
-    scale2.set_scale(calFactor2);
-    scale1.set_offset(chosen->tare1);
-    scale2.set_offset(chosen->tare2);
-    Serial.printf("[NVS] loaded from %s: cal1=%.6f cal2=%.6f tare1=%ld tare2=%ld crc=0x%08X\n",
-                  source, chosen->cal1, chosen->cal2, chosen->tare1, chosen->tare2, chosen->crc);
+    calFactorHandle = chosen->cal1;   // field "1" = handle (CH1)
+    calFactorHead   = chosen->cal2;   // field "2" = head   (CH2)
+    tareHandle      = chosen->tare1;
+    tareHead        = chosen->tare2;
+    Serial.printf("[NVS] loaded from %s: calHandle=%.6f calHead=%.6f tareHandle=%ld tareHead=%ld crc=0x%08X\n",
+                  source, calFactorHandle, calFactorHead, tareHandle, tareHead, chosen->crc);
   } else {
     Serial.println("[NVS] No valid calibration found in primary or backup - running uncalibrated");
-    calFactor1 = 1.0f;
-    calFactor2 = 1.0f;
+    calFactorHead   = 1.0f;
+    calFactorHandle = 1.0f;
   }
 }
 
