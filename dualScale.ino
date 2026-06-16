@@ -105,6 +105,10 @@ float calFactorHandle = 1.0f;   // CH1
 long  tareHead   = 0;           // CH2 zero-load raw
 long  tareHandle = 0;           // CH1 zero-load raw
 
+// True only while calibrate() is running. When set, nauReadChannel() echoes
+// every trimmed-average raw reading over serial for cal debugging.
+bool  calActive = false;
+
 // Calibration data structure for redundant NVS storage.
 // Field "1" = handle (CH1), field "2" = head (CH2).
 struct CalData {
@@ -853,6 +857,12 @@ bool nauReadChannel(uint8_t channel, int nSamples, long &out) {
     Serial.println("NAU7802 setChannel failed");
     return false;
   }
+  // The NAU7802's CH2 input pin is shared with the PGA bypass-cap ("CAP") pin.
+  // With PGA_CAP_EN set (the default), that cap loads/attenuates CH2, so CH2
+  // reads less per unit load than CH1. Clear it on every channel switch (not
+  // done by setChannel) so both channels have matched sensitivity. Must precede
+  // calibrateAFE so the AFE offset cal reflects the cap-disabled config.
+  nau.clearBit(NAU7802_PGA_PWR_PGA_CAP_EN, NAU7802_PGA_PWR);
   nau.calibrateAFE();                 // required after each channel switch
 
   // Discard the first few conversions after the switch (settling)
@@ -880,6 +890,11 @@ bool nauReadChannel(uint8_t channel, int nSamples, long &out) {
   }
   sum -= minVal + maxVal;             // trim outliers
   out = sum / (got - 2);
+  if (calActive) {
+    Serial.printf("[CAL] %s raw=%ld (n=%d min=%ld max=%ld)\n",
+                  (channel == CH_HEAD) ? "HEAD" : "HANDLE",
+                  out, got, minVal, maxVal);
+  }
   return true;
 }
 
@@ -1058,6 +1073,17 @@ float estimate_MOI() {
 }
 
 void calibrate() {
+  Serial.println();
+  Serial.println("========== ENTERING CALIBRATION MODE ==========");
+  Serial.println("Raw nauReadChannel() values echoed below as [CAL] lines");
+  calActive = true;
+  calibrateImpl();
+  calActive = false;
+  Serial.println("========== CALIBRATION MODE EXIT ==========");
+  Serial.println();
+}
+
+void calibrateImpl() {
   tare();
 
   float weights[4] = {0.0f, 100.0f, 200.0f, 300.0f};
