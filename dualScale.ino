@@ -165,9 +165,10 @@ static bool calDataValid(const CalData& d) {
   // Check CRC over everything except the crc field itself
   uint32_t expected = calCrc32(&d, offsetof(CalData, crc));
   if (d.crc != expected) return false;
-  // Range/NaN checks
-  if (isnan(d.cal1) || isinf(d.cal1) || d.cal1 < 0.1f || d.cal1 > 1000000.0f) return false;
-  if (isnan(d.cal2) || isinf(d.cal2) || d.cal2 < 0.1f || d.cal2 > 1000000.0f) return false;
+  // Range/NaN checks. A load cell wired so that load DECREASES counts yields a
+  // negative counts/gram slope, which is perfectly valid — gate on magnitude.
+  if (isnan(d.cal1) || isinf(d.cal1) || fabsf(d.cal1) < 0.1f || fabsf(d.cal1) > 1000000.0f) return false;
+  if (isnan(d.cal2) || isinf(d.cal2) || fabsf(d.cal2) < 0.1f || fabsf(d.cal2) > 1000000.0f) return false;
   if (d.tare1 == LONG_MIN || d.tare2 == LONG_MIN) return false;
   return true;
 }
@@ -922,13 +923,14 @@ void updateReadings() {
   }
   #endif
 
-  // Validate calibration factors to prevent NaN
-  if (calFactorHead < 0.1f || calFactorHead > 1000000.0f || isnan(calFactorHead) || isinf(calFactorHead)) {
+  // Validate calibration factors to prevent NaN. Gate on magnitude so a valid
+  // negative (decreasing) slope isn't rejected.
+  if (fabsf(calFactorHead) < 0.1f || fabsf(calFactorHead) > 1000000.0f || isnan(calFactorHead) || isinf(calFactorHead)) {
     showStatus("Invalid cal", "Head - recal");
     Serial.printf("Invalid calFactorHead: %.2f\n", calFactorHead);
     return;
   }
-  if (calFactorHandle < 0.1f || calFactorHandle > 1000000.0f || isnan(calFactorHandle) || isinf(calFactorHandle)) {
+  if (fabsf(calFactorHandle) < 0.1f || fabsf(calFactorHandle) > 1000000.0f || isnan(calFactorHandle) || isinf(calFactorHandle)) {
     showStatus("Invalid cal", "Handle - recal");
     Serial.printf("Invalid calFactorHandle: %.2f\n", calFactorHandle);
     return;
@@ -1027,21 +1029,47 @@ void perform_test() {
 
 // Returns true for short press, false if long-hold abort detected
 bool waitForButtonPress() {
-  // Wait for button to be pressed, showing live scale readings
+  // Make sure any prior press has fully released before we start watching, so
+  // a held-over press from the previous prompt isn't read as a fresh one.
+  while (digitalRead(BUTTON) == LOW) delay(10);
+  delay(50);  // debounce
+
+  // Wait for button to be pressed, showing live scale readings. Each NAU read
+  // blocks ~250ms (AFE cal + settle + samples); reading BOTH channels per cycle
+  // made the button unresponsive for ~0.5s at a time. Read one channel per
+  // cycle (alternating) and re-check the button right after, so a press that
+  // arrives during a read is caught promptly.
   unsigned long lastReadingUpdate = 0;
+  uint8_t liveToggle = 0;
+  long lastHead = 0, lastHandle = 0;
   while (digitalRead(BUTTON) == HIGH) {
-    // Update live scale readings every 500ms
-    if (millis() - lastReadingUpdate >= 500) {
+    if (millis() - lastReadingUpdate >= 250) {
       lastReadingUpdate = millis();
-      long rawHead = 0, rawHandle = 0;
-      nauReadChannel(CH_HEAD,   LIVE_SAMPLES, rawHead);
-      nauReadChannel(CH_HANDLE, LIVE_SAMPLES, rawHandle);
+      long raw = 0;
+      if (liveToggle == 0) {
+        if (nauReadChannel(CH_HEAD, LIVE_SAMPLES, raw)) lastHead = raw;
+      } else {
+        if (nauReadChannel(CH_HANDLE, LIVE_SAMPLES, raw)) lastHandle = raw;
+      }
+      liveToggle ^= 1;
+
+      // Erase the reading rows before redraw so stale digits from a longer
+      // previous value don't linger (printLine() does not clear its background).
+      #if DISPLAY_TYPE_OLED
+        display.fillRect(0, 36, SCREEN_WIDTH, SCREEN_HEIGHT - 36, BLACK);
+      #else
+        tft.fillRect(0, 36, 240, 44, TFT_BLACK);
+      #endif
       // Display on lower lines (prompt text is on lines 0 and 16)
-      Display::printLine(36, String("Head: ") + String(rawHead));
-      Display::printLine(48, String("Hand: ") + String(rawHandle));
+      Display::printLine(36, String("Head: ") + String(lastHead));
+      Display::printLine(48, String("Hand: ") + String(lastHandle));
       #if DISPLAY_TYPE_OLED
         display.display();
       #endif
+
+      // A press may have landed during the blocking read above — catch it now
+      // instead of waiting for the next 250ms tick.
+      if (digitalRead(BUTTON) == LOW) break;
     }
     delay(10);
   }
@@ -1146,7 +1174,8 @@ void calibrateImpl() {
   }
 
   calFactorHead = num / den;
-  if (calFactorHead < 0.1f || calFactorHead > 1000000.0f || isnan(calFactorHead)) {
+  // Accept negative (decreasing) slopes — only the magnitude must be sane.
+  if (fabsf(calFactorHead) < 0.1f || fabsf(calFactorHead) > 1000000.0f || isnan(calFactorHead)) {
     showStatus("Cal failed!", "Head invalid");
     Serial.printf("Head invalid factor: %.2f\n", calFactorHead);
     delay(2000);
@@ -1173,7 +1202,8 @@ void calibrateImpl() {
   }
 
   calFactorHandle = num / den;
-  if (calFactorHandle < 0.1f || calFactorHandle > 1000000.0f || isnan(calFactorHandle)) {
+  // Accept negative (decreasing) slopes — only the magnitude must be sane.
+  if (fabsf(calFactorHandle) < 0.1f || fabsf(calFactorHandle) > 1000000.0f || isnan(calFactorHandle)) {
     showStatus("Cal failed!", "Handle invalid");
     Serial.printf("Handle invalid factor: %.2f\n", calFactorHandle);
     delay(2000);
