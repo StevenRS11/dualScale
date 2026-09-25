@@ -13,43 +13,30 @@ This is an ESP32-S3-based dual load cell system designed for measuring paddle ma
 **Microcontroller:** ESP32-S3-ZERO (only **two** hardware I2C controllers: `Wire` = I2C0, `Wire1` = I2C1)
 
 **Load Cell Amp (NAU7802, I2C 0x2A):**
-- Bus: `Wire1` (time-shared — see below), SDA=3 (SDIO), SCL=4 (SCLK), DRDY=6 (optional, polling used instead)
+- Bus: `Wire1` (dedicated), SDA=3 (SDIO), SCL=4 (SCLK), DRDY=6 (optional, polling used instead)
 - CH2 (`NAU7802_CHANNEL_2`) = **head** (load cell B)
 - CH1 (`NAU7802_CHANNEL_1`) = **handle**
 
 **I2C Devices:**
 - OLED (SSD1306 128x64): `Wire`, SDA=8, SCL=7, addr 0x3C
-- NFC reader (MFRC522): `Wire1` (time-shared), SDA=10, SCL=11, addr 0x28
-- NAU7802: `Wire1` (time-shared), SDA=3, SCL=4, addr 0x2A
+- NFC reader (MFRC522): `Wire` (shared with OLED), SDA=8, SCL=7, addr 0x28
+- NAU7802: `Wire1`, SDA=3, SCL=4, addr 0x2A
 
 **Button:**
 - Pin 9 with INPUT_PULLUP
 
-### I2C Bus Topology & Time-Sharing
+### I2C Bus Topology
 
-The ESP32-S3 has only two hardware I2C controllers, but the PCB wires three I2C
-devices on three separate pin pairs. The OLED gets its own controller (`Wire`).
-The NAU7802 and the NFC reader **share the `Wire1` controller** on different pins,
-which works because the scale and the NFC are used in separate phases of the
-workflow (measure first, then write the tag).
+Two buses, one per hardware controller, same layout as pushbuttonDEF:
+- `Wire` (I2C0, SDA=8/SCL=7): OLED + NFC reader, both at 400 kHz.
+- `Wire1` (I2C1, SDA=3/SCL=4): NAU7802 alone.
 
-`selectBus(BusOwner who)` arbitrates `Wire1`:
-- `BUS_NAU` → `Wire1.begin(3, 4)` at 400 kHz. NAU7802 config persists across the
-  switch, so no re-`begin()` is needed.
-- `BUS_NFC` → `Wire1.begin(10, 11)` at 400 kHz, then `nfc.begin(Wire1)` to re-init
-  the reader.
+Both are initialized once in `scanI2CModules()`. `nfc.begin(Wire)` does not
+re-initialize the bus. `Wire.setClock(400000)` is re-applied after `display.begin()`.
 
-`busOwner` tracks the current owner; `selectBus()` is a no-op if already selected.
-`nauReadChannel()` always asserts `BUS_NAU` and the NFC state handlers assert
-`BUS_NFC`, so the bus self-heals on every state transition (returning to IDLE and
-reading the scale automatically pulls the bus back to the NAU).
-
-> **Planned hardware change:** Eventually the RFID connector and the screen will
-> share a single I2C bus (OLED + NFC together on `Wire`), freeing `Wire1` for the
-> NAU7802 exclusively. That removes the `Wire1` time-sharing entirely — `selectBus()`
-> and its `selectBus(BUS_*)` call sites can be deleted, NFC moves to `Wire`, and the
-> NAU7802 stays on `Wire1` without re-pointing. Until that board revision exists, the
-> time-share scheme above is required.
+> Older PCBs wired the NFC reader to its own pins (10/11) and the firmware
+> time-shared `Wire1` between the NAU and the NFC via `selectBus()`. That scheme
+> was removed; don't reintroduce it for current boards.
 
 ## Core Architecture
 
@@ -109,8 +96,8 @@ The NAU7802 multiplexes one ADC across two channels, so the two load cells
 **cannot** be read simultaneously (unlike the old per-HX711 ring buffers).
 
 `nauReadChannel(uint8_t channel, int nSamples, long &out)`:
-1. `selectBus(BUS_NAU)` — ensure the amp owns `Wire1`
-2. `nau.setChannel(channel)` (bails out, returning false, on I2C failure)
+1. `nau.setChannel(channel)` (bails out, returning false, on I2C failure)
+2. Clear `PGA_CAP_EN` (CH2 shares the bypass-cap pin; see the comment in code)
 3. `nau.calibrateAFE()` — internal-mode AFE offset cal, **required after each channel
    switch**. Internal mode shorts the inputs internally, so it does NOT zero the
    external load; the no-load offset is handled by the software tare instead.
@@ -189,15 +176,11 @@ float estimate_MOI() {
 ## Pin Definitions
 
 ```cpp
-// OLED I2C (Wire, dedicated controller)
+// OLED + NFC I2C (Wire, shared bus)
 SCREEN_SDA = 8
 SCREEN_SCL = 7
 
-// NFC I2C (Wire1, time-shared with NAU7802)
-RFID_SDA = 10
-RFID_SCL = 11
-
-// NAU7802 I2C (Wire1, time-shared with NFC)
+// NAU7802 I2C (Wire1, dedicated)
 NAU_SDA  = 3   // SDIO
 NAU_SCL  = 4   // SCLK
 NAU_DRDY = 6   // data-ready (optional; available() polling used)
@@ -212,15 +195,14 @@ BUTTON = 9     // INPUT_PULLUP
 2. Button pin configuration with INPUT_PULLUP
 3. Check if button held during boot → calibration mode flag
 4. NVS crash detection (bootCount)
-5. `scanI2CModules()` — probe OLED/NAU/NFC across the time-shared bus and print a
-   structured connectivity report over serial; leaves `Wire1` on the NAU pins
+5. `scanI2CModules()` — initialize `Wire` and `Wire1`, probe OLED/NFC/NAU and print a
+   structured connectivity report over serial
 6. Display initialization (`Wire`)
-7. NAU7802 init (`Wire1` on NAU pins): `begin`, `setLDO`/`setGain`/`setSampleRate`, `calibrateAFE`
-8. Payload/NFC init: `selectBus(BUS_NFC)` → `nfc.begin`, `crypto.begin`, allocate `MeasurementAccumulator`
-9. `selectBus(BUS_NAU)` — return the shared bus to the load cell amp
-10. Load calibration from NVS (skipped on boot-loop detection), then tare
-11. Clear bootCount (successful boot)
-12. Enter calibration mode if button was held
+7. NAU7802 init (`Wire1`): `begin`, `setLDO`/`setGain`/`setSampleRate`, `calibrateAFE`
+8. Payload/NFC init: `nfc.begin(Wire)`, `crypto.begin`, allocate `MeasurementAccumulator`
+9. Load calibration from NVS (skipped on boot-loop detection), then tare
+10. Clear bootCount (successful boot)
+11. Enter calibration mode if button was held
 
 ### I2C Module Report
 
@@ -231,10 +213,9 @@ ACK on the bus, e.g.:
 ================ I2C Module Report ================
   Module        Bus   Pins     Addr  Status
   ------------------------------------------------
-  OLED Display  Wire  SDA8/7   0x3C  CONNECTED
-  NAU7802 amp   Wire1 SDA3/4   0x2A  CONNECTED
-  NFC MFRC522   Wire1 SDA10/11 0x28  -- MISSING --
-  (NAU7802 + NFC time-share the Wire1 controller)
+  OLED Display  Wire  SDA8/7  0x3C  CONNECTED
+  NFC MFRC522   Wire  SDA8/7  0x28  CONNECTED
+  NAU7802 amp   Wire1 SDA3/4  0x2A  -- MISSING --
 ===================================================
 ```
 
@@ -245,11 +226,9 @@ ACK on the bus, e.g.:
 - `calibrateAFE()` runs after every channel switch (every read alternates channels)
 - A live `updateReadings()` reads one channel (~150–250 ms); measurement reads both
 
-**I2C / Bus Sharing:**
-- `Wire` clock 400 kHz (OLED); `Wire1` clock 400 kHz (NAU and NFC)
-- `Wire1` is re-pointed between NAU (3/4) and NFC (10/11) via `selectBus()`
-- Switching calls `Wire1.end()` then `Wire1.begin(pins)`; the off-bus device retains
-  its chip configuration while idle
+**I2C:**
+- `Wire` clock 400 kHz (OLED + NFC); `Wire1` clock 400 kHz (NAU)
+- `Wire.setClock()` must follow `display.begin()`
 
 **NVS Storage:**
 - Namespaces: "dualScale" (primary) + "dualScaleBak" (backup), CRC-protected
@@ -304,12 +283,12 @@ Boot loop protection:
 1. Short press button (release before 3 seconds)
 2. Wait for 4-second stabilization
 3. Results displayed with BP/ESW/Mass
-4. Present NFC tag when prompted (firmware switches `Wire1` to the NFC reader)
+4. Present NFC tag when prompted
 5. Tag is written with HeadWeight and HandleWeight measurements
 
 **Abort Measurement/NFC Write:**
 - Hold button for 3 seconds during any measurement or NFC operation
-- Tag is released, operation cancelled, bus handed back to the NAU, returns to IDLE
+- Tag is released, operation cancelled, returns to IDLE
 
 **Read Values:**
 - Display automatically updates every 500 ms in IDLE state

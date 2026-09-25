@@ -3,33 +3,25 @@
   Reads a single NAU7802 dual-channel ADC (head = CH2 / load cell B,
   handle = CH1) and displays Balance Point / Equivalent Swing Weight.
 
-  I2C topology (ESP32-S3 has only TWO hardware I2C controllers):
-    Wire  (I2C0): OLED display only            -> SDA=8,  SCL=7
-    Wire1 (I2C1): TIME-SHARED on demand:
-                  - NAU7802 load cell amp      -> SDA=3,  SCL=4  (DRDY=6)
-                  - NFC reader (MFRC522)       -> SDA=10, SCL=11
-  The scale and the NFC are used in separate phases, so Wire1 is re-pointed
-  to the active device's pins via selectBus(). See selectBus().
+  I2C topology (ESP32-S3 has two hardware I2C controllers):
+    Wire  (I2C0): OLED display + NFC reader    -> SDA=8, SCL=7
+    Wire1 (I2C1): NAU7802 load cell amp only   -> SDA=3, SCL=4  (DRDY=6)
 */
 
 #define DISPLAY_TYPE_TFT   0
 #define DISPLAY_TYPE_OLED  1
 
-// OLED I2C pins (Wire, dedicated)
+// OLED + NFC I2C pins (Wire, shared bus)
 #define SCREEN_SDA    8   // GP8
 #define SCREEN_SCL    7   // GP7
 
-// NFC I2C pins (Wire1, time-shared with NAU7802)
-#define RFID_SDA      10  // GP10
-#define RFID_SCL      11  // GP11
-
-// NAU7802 I2C pins (Wire1, time-shared with NFC)
+// NAU7802 I2C pins (Wire1, dedicated)
 #define NAU_SDA       3   // GP3 (SDIO)
 #define NAU_SCL       4   // GP4 (SCLK)
 #define NAU_DRDY      6   // GP6 (data-ready; optional, we poll available())
 
 #define OLED_ADDR 0x3C
-#define NFC_ADDR  0x28   // MFRC522 on Wire1
+#define NFC_ADDR  0x28   // MFRC522 on Wire
 #define NAU_ADDR  0x2A   // NAU7802 on Wire1
 
 #define BUTTON  9
@@ -54,7 +46,7 @@ using namespace PaddleDNA;
   #include <Adafruit_SSD1306.h>
   #define SCREEN_WIDTH 128
   #define SCREEN_HEIGHT 64
-  // Wire drives the OLED only; Wire1 is time-shared (NAU7802 / NFC)
+  // Wire drives the OLED and NFC reader; Wire1 is the NAU7802's alone
   Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #endif
 
@@ -72,12 +64,6 @@ const int NAU_SETTLE_SAMPLES = 2;
 const int LIVE_SAMPLES       = 5;   // per channel, live display
 const int MEAS_SAMPLES       = 12;  // per channel, final measurement
 const int TARE_SAMPLES       = 12;  // per channel, tare
-
-// Wire1 is a single hardware controller shared between the NAU7802 and the
-// NFC reader, which live on different pins. selectBus() re-points it.
-enum BusOwner { BUS_NONE, BUS_NAU, BUS_NFC };
-BusOwner busOwner = BUS_NONE;
-void selectBus(BusOwner who);
 
 // PaddleDNA Payload library
 NFC nfc;
@@ -255,12 +241,12 @@ namespace Display {
     tft.setTextDatum(TL_DATUM);
   #elif DISPLAY_TYPE_OLED
     Wire.begin(SCREEN_SDA, SCREEN_SCL);
-    Wire.setClock(400000);
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
       Serial.println(F("SSD1306 allocation failed"));
       for (;;)
         delay(100);
     }
+    Wire.setClock(400000);   // must come AFTER display.begin(), which resets it
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
@@ -319,64 +305,30 @@ static void reportI2CModule(const char *name, const char *busName,
                 present ? "CONNECTED" : "-- MISSING --");
 }
 
-// Re-point the time-shared Wire1 controller between the NAU7802 and the NFC
-// reader (they sit on different pins of the same hardware I2C peripheral).
-void selectBus(BusOwner who) {
-  if (busOwner == who) return;
-  Wire1.end();
-  delay(2);
-  if (who == BUS_NAU) {
-    Wire1.begin(NAU_SDA, NAU_SCL);
-    Wire1.setClock(NAU_I2C_HZ);
-    // NAU7802 retains its configuration across the bus idling, so no re-begin.
-  } else {  // BUS_NFC
-    Wire1.begin(RFID_SDA, RFID_SCL);
-    Wire1.setClock(400000);
-    nfc.begin(Wire1);   // re-init the reader now that the bus points at it
-  }
-  busOwner = who;
-  delay(2);
-}
-
-// Probe every known module (across the time-shared Wire1) and print a
-// structured connectivity report. Leaves Wire1 pointed at the NAU7802.
+// Probe every known module and print a structured connectivity report.
+// Leaves Wire (OLED + NFC) and Wire1 (NAU7802) initialized.
 static bool g_oledPresent = false;
 static bool g_nfcPresent  = false;
 static bool g_nauPresent  = false;
 
 static void scanI2CModules() {
-  // OLED lives alone on its own controller (Wire)
+  // OLED and NFC share Wire; the NAU7802 has Wire1 to itself
   Wire.begin(SCREEN_SDA, SCREEN_SCL);
   Wire.setClock(400000);
-
-  // Wire1 is time-shared: probe the NAU pins first...
   Wire1.begin(NAU_SDA, NAU_SCL);
   Wire1.setClock(NAU_I2C_HZ);
-  delay(50);
+  delay(100);  // ESP32-S3: let the buses settle before the first transaction
   g_oledPresent = i2cProbe(Wire, OLED_ADDR);
+  g_nfcPresent  = i2cProbe(Wire, NFC_ADDR);
   g_nauPresent  = i2cProbe(Wire1, NAU_ADDR);
-
-  // ...then re-point Wire1 to the NFC pins and probe there
-  Wire1.end();
-  Wire1.begin(RFID_SDA, RFID_SCL);
-  Wire1.setClock(400000);
-  delay(20);
-  g_nfcPresent = i2cProbe(Wire1, NFC_ADDR);
-
-  // Leave Wire1 on the NAU for normal (idle) operation
-  Wire1.end();
-  Wire1.begin(NAU_SDA, NAU_SCL);
-  Wire1.setClock(NAU_I2C_HZ);
-  busOwner = BUS_NAU;
 
   Serial.println();
   Serial.println("================ I2C Module Report ================");
   Serial.println("  Module        Bus   Pins     Addr  Status");
   Serial.println("  ------------------------------------------------");
-  reportI2CModule("OLED Display", "Wire",  "SDA8/7",   OLED_ADDR, g_oledPresent);
-  reportI2CModule("NAU7802 amp",  "Wire1", "SDA3/4",   NAU_ADDR,  g_nauPresent);
-  reportI2CModule("NFC MFRC522",  "Wire1", "SDA10/11", NFC_ADDR,  g_nfcPresent);
-  Serial.println("  (NAU7802 + NFC time-share the Wire1 controller)");
+  reportI2CModule("OLED Display", "Wire",  "SDA8/7", OLED_ADDR, g_oledPresent);
+  reportI2CModule("NFC MFRC522",  "Wire",  "SDA8/7", NFC_ADDR,  g_nfcPresent);
+  reportI2CModule("NAU7802 amp",  "Wire1", "SDA3/4", NAU_ADDR,  g_nauPresent);
   Serial.println("===================================================");
   Serial.println();
   Serial.flush();  // push the report out before the heavier init work
@@ -423,15 +375,14 @@ void setup() {
     prefs.end();
   }
 
-  // Probe all I2C modules (across the time-shared Wire1) and print a report.
-  // Leaves Wire1 pointed at the NAU7802 (busOwner == BUS_NAU).
+  // Probe all I2C modules and print a report. Initializes Wire and Wire1.
   scanI2CModules();
 
   Serial.println("Display Init start");
   Display::begin();
   Serial.println("Display Init finish");
 
-  // NAU7802 load cell amp (Wire1 currently on NAU pins from scanI2CModules)
+  // NAU7802 load cell amp (Wire1, initialized by scanI2CModules)
   Serial.println("NAU7802 Init Start");
   if (!nau.begin(Wire1)) {
     Serial.println("NAU7802 init failed - load cell amp not detected");
@@ -444,12 +395,10 @@ void setup() {
     Serial.println("NAU7802 initialized successfully");
   }
 
-  // Initialize Payload library (re-point Wire1 to the NFC pins)
+  // Initialize Payload library (NFC reader shares Wire with the OLED)
   Serial.println("Payload Init Start");
-  selectBus(BUS_NFC);          // Wire1 -> RFID pins + nfc.begin()
-  delay(100);                  // stabilize I2C before talking to the reader
   nfc.setDebug(true);
-  if (!nfc.begin(Wire1)) {
+  if (!nfc.begin(Wire)) {
     Serial.println("NFC init failed");
     showStatus("NFC Error", "Init failed");
   } else {
@@ -465,9 +414,6 @@ void setup() {
 
   accumulator = new MeasurementAccumulator(nfc, crypto, 9);
   Serial.println("Payload Init Finish");
-
-  // Return the shared bus to the NAU7802 for live operation
-  selectBus(BUS_NAU);
 
   if (skipCalibration) {
     Serial.println("[NVS] Skipping calibration load due to boot loop detection");
@@ -527,9 +473,7 @@ void loop() {
         } else {
           // In any other state (NFC workflow): ABORT
           Serial.println("Long press - aborting operation");
-          selectBus(BUS_NFC);  // ensure the reader is addressable before halt
           nfc.halt();          // Release tag if one is selected
-          selectBus(BUS_NAU);  // hand the shared bus back to the load cell amp
           showStatus("Cancelled");
           delay(1000);
           currentState = IDLE;
@@ -665,9 +609,6 @@ void handleDisplayResultsState() {
 }
 
 void handleWaitingForNfcState() {
-  // Hand the shared Wire1 controller to the NFC reader (no-op if already there)
-  selectBus(BUS_NFC);
-
   // Check for timeout
   if (millis() - stateStartTime >= NFC_TIMEOUT) {
     Serial.println("NFC timeout");
@@ -691,8 +632,6 @@ void handleWaitingForNfcState() {
 void handleWritingNfcState() {
   // Only execute write logic once when first entering this state
   static unsigned long lastStateEntry = 0;
-
-  selectBus(BUS_NFC);  // ensure the reader owns the shared bus before writing
 
   if (stateStartTime != lastStateEntry) {
     // State just entered - update display and perform write
@@ -762,8 +701,6 @@ void handleRetryPromptState() {
   // Only update display once when first entering this state
   static unsigned long lastStateEntry = 0;
   static bool tagWasRemoved = false;
-
-  selectBus(BUS_NFC);  // tag polling happens here; keep the reader on the bus
 
   if (stateStartTime != lastStateEntry) {
     // State just changed - redraw display
@@ -853,7 +790,6 @@ static bool nauNextSample(long &out, unsigned long timeoutMs) {
 // Returns false on I2C/timeout failure.
 bool nauReadChannel(uint8_t channel, int nSamples, long &out) {
   out = 0;
-  selectBus(BUS_NAU);                 // ensure the amp owns the shared bus
   if (!nau.setChannel(channel)) {
     Serial.println("NAU7802 setChannel failed");
     return false;
