@@ -441,7 +441,74 @@ void setup() {
   }
 }
 
+// ---- Temporary NAU7802 debug console (serial, newline-terminated) ----
+// hold on|off        suspend/resume live IDLE reads
+// regs               dump NAU registers 0x00-0x1F
+// raw <ch> <n> [nc]  read n raw samples on ch (1/2); "nc" skips calibrateAFE
+// gain <0-7> | sps <0-7> | ldo <0-7> | cap <0|1> | wreg <reg> <val> (decimal) | init | afe
+bool dbgHold = false;
+
+static void dbgRaw(uint8_t ch, int n, bool doCal) {
+  bool okCh = nau.setChannel(ch == 2 ? NAU7802_CHANNEL_2 : NAU7802_CHANNEL_1);
+  nau.clearBit(NAU7802_PGA_PWR_PGA_CAP_EN, NAU7802_PGA_PWR);
+  bool okCal = doCal ? nau.calibrateAFE() : true;
+  Serial.printf("[DBG] ch=%u setChannel=%d afe=%s ctrl2=0x%02X ofs=%ld gain=0x%08lX\n",
+                ch, okCh, doCal ? (okCal ? "ok" : "ERR") : "skip",
+                nau.getRegister(NAU7802_CTRL2),
+                (long)nau.get24BitRegister(NAU7802_OCAL1_B2),
+                (unsigned long)nau.get32BitRegister(NAU7802_GCAL1_B3));
+  for (int i = 0; i < n; ++i) {
+    long v;
+    if (!nauNextSample(v, 500)) { Serial.println("[DBG] timeout"); return; }
+    Serial.printf("[DBG] %d: %ld (0x%06lX)\n", i, v, (unsigned long)(v & 0xFFFFFF));
+  }
+}
+
+static void debugConsole() {
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') { line += c; continue; }
+    line.trim();
+    if (line.length() == 0) continue;
+    String cmd = line; line = "";
+    int a = 0, b = 0;
+    char w[8] = {0};
+    int nArgs = sscanf(cmd.c_str(), "%*s %d %d %7s", &a, &b, w);
+    if (cmd.startsWith("hold")) {
+      dbgHold = cmd.endsWith("on");
+      Serial.printf("[DBG] hold=%d\n", dbgHold);
+    } else if (cmd == "regs") {
+      for (uint8_t r = 0; r <= 0x1F; ++r)
+        Serial.printf("[DBG] reg 0x%02X = 0x%02X\n", r, nau.getRegister(r));
+    } else if (cmd.startsWith("raw")) {
+      dbgRaw(a, nArgs >= 2 ? b : 5, !(nArgs >= 3 && strcmp(w, "nc") == 0));
+    } else if (cmd.startsWith("gain")) {
+      Serial.printf("[DBG] setGain(%d)=%d\n", a, nau.setGain(a));
+    } else if (cmd.startsWith("sps")) {
+      Serial.printf("[DBG] setSampleRate(%d)=%d\n", a, nau.setSampleRate(a));
+    } else if (cmd.startsWith("ldo")) {
+      Serial.printf("[DBG] setLDO(%d)=%d\n", a, nau.setLDO(a));
+    } else if (cmd.startsWith("cap")) {
+      bool ok = a ? nau.setBit(NAU7802_PGA_PWR_PGA_CAP_EN, NAU7802_PGA_PWR)
+                  : nau.clearBit(NAU7802_PGA_PWR_PGA_CAP_EN, NAU7802_PGA_PWR);
+      Serial.printf("[DBG] cap=%d ok=%d\n", a, ok);
+    } else if (cmd.startsWith("wreg")) {
+      Serial.printf("[DBG] reg 0x%02X <= 0x%02X ok=%d readback=0x%02X\n", a, b,
+                    nau.setRegister(a, b), nau.getRegister(a));
+    } else if (cmd == "init") {
+      Serial.printf("[DBG] begin=%d\n", nau.begin(Wire1));
+    } else if (cmd == "afe") {
+      Serial.printf("[DBG] calibrateAFE=%d\n", nau.calibrateAFE());
+    } else {
+      Serial.printf("[DBG] unknown: %s\n", cmd.c_str());
+    }
+  }
+}
+
 void loop() {
+  debugConsole();
+
   // Button monitoring with short/long press detection
   bool buttonPressed = (digitalRead(BUTTON) == LOW);
 
@@ -520,7 +587,7 @@ void loop() {
 }
 
 void handleIdleState() {
-  if (millis() - lastUpdate >= updateInterval) {
+  if (!dbgHold && millis() - lastUpdate >= updateInterval) {
     lastUpdate = millis();
     updateReadings();
   }
